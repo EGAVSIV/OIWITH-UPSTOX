@@ -290,7 +290,7 @@ greeks_df.insert(1, "Close", spot_price)
 # highlight function FIXED
 def highlight_atm(row):
     if row["Strike"] == atm_strike:
-        return ['background-color: #fff3b0'] * len(row)
+        return ['background-color: #c487de'] * len(row)
     return [''] * len(row)
 
 styled = greeks_df.style.apply(highlight_atm, axis=1)
