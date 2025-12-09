@@ -337,9 +337,24 @@ st.subheader("🧠 Suggested strikes to CONSIDER for BUY (calls / puts)")
 score_rows_ce = []
 score_rows_pe = []
 # ensure we have some max values to normalize
-max_iv_change = max(df["CE_IV_change"].abs().max(), df["PE_IV_change"].abs().max(), 1)
-max_delta = max(df[["CE_Delta", "PE_Delta"]].abs().max(), 1)
-max_oi_change = max(abs(df["CE_OI_change%"].max()), abs(df["PE_OI_change%"].max()), 1)
+# convert to scalars
+max_iv_change = max(
+    df["CE_IV_change"].abs().max().item(),
+    df["PE_IV_change"].abs().max().item(),
+    1
+)
+
+max_delta = max(
+    df[["CE_Delta", "PE_Delta"]].abs().max().max().item(),
+    1
+)
+
+max_oi_change = max(
+    abs(df["CE_OI_change%"].max().item()),
+    abs(df["PE_OI_change%"].max().item()),
+    1
+)
+
 
 for i, row in df.iterrows():
     strike = row["Strike"]
