@@ -272,43 +272,40 @@ else:
     st.plotly_chart(fig_pcr, use_container_width=True)
 
 # ======= Greeks table with ATM highlighted (blue) and formatted numbers =======
+# ======= Greeks table with ATM highlighted (blue) and formatted numbers =======
 st.subheader("📚 Greeks Table (ATM highlighted)")
 
 greeks_df = df[["Strike_int", "Strike", "CE_Delta", "CE_Theta", "CE_IV",
                 "PE_Delta", "PE_Theta", "PE_IV"]].copy()
-# rename Strike_int -> Strike for display (int)
+
+# Rename Strike_int to Strike (for display)
 greeks_df = greeks_df.rename(columns={"Strike_int": "Strike"})
 
-# insert Close column after Strike (2 decimals)
+# Insert Close price after Strike (2 decimals)
 greeks_df.insert(1, "Close", round(spot_price, 2))
 
-# formatting map: lambda to format numeric columns to 2 decimals (except Strike int)
-format_map = {
-    "Close": "{:.2f}",
-    "CE_Delta": "{:.2f}",
-    "CE_Theta": "{:.2f}",
-    "CE_IV": "{:.2f}",
-    "PE_Delta": "{:.2f}",
-    "PE_Theta": "{:.2f}",
-    "PE_IV": "{:.2f}",
-}
+# ----- Format all numeric columns (except Strike) to 2 decimals -----
+for col in ["Close", "CE_Delta", "CE_Theta", "CE_IV", "PE_Delta", "PE_Theta", "PE_IV"]:
+    greeks_df[col] = greeks_df[col].astype(float).round(2)
 
-# style: ATM highlight blue (#7499e3) and number formatting
-def highlight_atm(row):
+# ----- ATM highlight using applymap (no KeyError) -----
+atm_int = int(round(atm_strike))   # ATM strike rounded to nearest int
+
+def atm_highlighter(val):
+    """Highlights only the ATM strike cell in blue."""
     try:
-        strike_val = int(round(row.iloc[0]))  # first column = Strike always
+        # Highlight only the strike column (exact match)
+        if int(float(val)) == atm_int:
+            return "background-color: #7499e3; font-weight: bold;"
     except:
-        return [''] * len(row)
+        pass
+    return ""
 
-    if strike_val == int(atm_strike):
-        return ['background-color: #7499e3'] * len(row)
+styled = greeks_df.style.applymap(atm_highlighter, subset=["Strike"])
 
-    return [''] * len(row)
-
-
-
-styled = greeks_df.style.apply(highlight_atm, axis=1).format(format_map)
+# Display table
 st.dataframe(styled, use_container_width=True)
+
 
 # ======= OTM1 & OTM2 OI Change tables with manual pct filter =======
 st.subheader("📉 OTM1 & OTM2 OI Change (filter by percent range)")
