@@ -295,9 +295,17 @@ format_map = {
 
 # style: ATM highlight blue (#7499e3) and number formatting
 def highlight_atm(row):
-    if row["Strike"] == int(atm_strike):
+    # row["Strike"] is a scalar because we used axis=1, so ensure conversion:
+    try:
+        strike_val = int(row["Strike"])
+    except:
+        strike_val = row["Strike"]
+
+    if strike_val == int(atm_strike):
         return ['background-color: #7499e3'] * len(row)
+
     return [''] * len(row)
+
 
 styled = greeks_df.style.apply(highlight_atm, axis=1).format(format_map)
 st.dataframe(styled, use_container_width=True)
