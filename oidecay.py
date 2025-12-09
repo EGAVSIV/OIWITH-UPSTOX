@@ -56,14 +56,40 @@ def get_expiries(instrument_key):
     r = requests.get(url, headers=HEADERS, params={"instrument_key": instrument_key})
     if r.status_code != 200:
         return []
+
     data = r.json().get("data", [])
-    exp = []
+    expiries = set()
+
     for item in data:
         raw = item.get("expiry")
-        if raw:
-            dt = datetime.utcfromtimestamp(raw/1000)
-            exp.append(dt.strftime("%Y-%m-%d"))
-    return sorted(list(set(exp)))
+
+        # Case 1: already a date string
+        if isinstance(raw, str):
+            try:
+                dt = pd.to_datetime(raw)
+                expiries.add(dt.strftime("%Y-%m-%d"))
+                continue
+            except:
+                pass
+
+        # Case 2: numeric ms timestamp
+        if isinstance(raw, (int, float)):
+            try:
+                # detect if milliseconds or seconds
+                if raw > 1e12:      # ms timestamp
+                    dt = datetime.utcfromtimestamp(raw / 1000)
+                else:               # seconds timestamp
+                    dt = datetime.utcfromtimestamp(raw)
+                expiries.add(dt.strftime("%Y-%m-%d"))
+                continue
+            except:
+                pass
+
+        # Case 3: ignore invalid formats
+        continue
+
+    return sorted(list(expiries))
+
 
 def get_chain(instrument_key, expiry):
     url = f"{BASE_URL}/option/chain"
