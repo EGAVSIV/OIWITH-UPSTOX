@@ -275,36 +275,41 @@ else:
 # ======= Greeks table with ATM highlighted (blue) and formatted numbers =======
 st.subheader("📚 Greeks Table (ATM highlighted)")
 
-greeks_df = df[["Strike_int", "Strike", "CE_Delta", "CE_Theta", "CE_IV",
-                "PE_Delta", "PE_Theta", "PE_IV"]].copy()
+# --- Build Greeks DF safely (no duplicate column names) ---
+greeks_df = df[
+    ["Strike_int", "CE_Delta", "CE_Theta", "CE_IV",
+     "PE_Delta", "PE_Theta", "PE_IV"]
+].copy()
 
-# Rename Strike_int to Strike (for display)
+# Rename Strike_int → Strike (this is the ONLY strike column)
 greeks_df = greeks_df.rename(columns={"Strike_int": "Strike"})
 
-# Insert Close price after Strike (2 decimals)
+# Insert Close after Strike
 greeks_df.insert(1, "Close", round(spot_price, 2))
 
-# ----- Format all numeric columns (except Strike) to 2 decimals -----
+# Format numeric columns
 for col in ["Close", "CE_Delta", "CE_Theta", "CE_IV", "PE_Delta", "PE_Theta", "PE_IV"]:
     greeks_df[col] = greeks_df[col].astype(float).round(2)
 
-# ----- ATM highlight using applymap (no KeyError) -----
-atm_int = int(round(atm_strike))   # ATM strike rounded to nearest int
+# ATM strike rounded to int
+atm_int = int(round(atm_strike))
 
+# Define cell highlighter for Strike column
 def atm_highlighter(val):
-    """Highlights only the ATM strike cell in blue."""
+    """Highlights ATM strike cell in blue."""
     try:
-        # Highlight only the strike column (exact match)
         if int(float(val)) == atm_int:
             return "background-color: #7499e3; font-weight: bold;"
     except:
         pass
     return ""
 
+# Apply style only to Strike column (safe)
 styled = greeks_df.style.applymap(atm_highlighter, subset=["Strike"])
 
 # Display table
 st.dataframe(styled, use_container_width=True)
+
 
 
 # ======= OTM1 & OTM2 OI Change tables with manual pct filter =======
