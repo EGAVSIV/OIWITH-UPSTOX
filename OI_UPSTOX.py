@@ -278,18 +278,25 @@ else:
     st.plotly_chart(fig_pcr, use_container_width=True)
 
 # ========== Greeks table with ATM highlighted & Close price ==========
+# ========== Greeks table with ATM highlighted & Close price ==========
 st.subheader("📚 Greeks Table (ATM highlighted)")
 
-greeks_df = df[["Strike", "CE_Delta", "CE_Theta", "CE_IV", "PE_Delta", "PE_Theta", "PE_IV"]].copy()
-# add Close Price column (same spot for underlying) and mark ATM
+greeks_df = df[["Strike", "CE_Delta", "CE_Theta", "CE_IV",
+                "PE_Delta", "PE_Theta", "PE_IV"]].copy()
+
+# add Close Price column
 greeks_df.insert(1, "Close", spot_price)
 
-# style: highlight ATM row
-def highlight_atm(s):
-    return ['background-color: #fff3b0' if v == atm_strike else '' for v in s["Strike"]]
+# highlight function FIXED
+def highlight_atm(row):
+    if row["Strike"] == atm_strike:
+        return ['background-color: #fff3b0'] * len(row)
+    return [''] * len(row)
 
 styled = greeks_df.style.apply(highlight_atm, axis=1)
+
 st.dataframe(styled, use_container_width=True)
+
 
 # ========== OTM decay tables (decay shown as negative for reductions) ==========
 st.subheader("📉 OTM1 & OTM2 OI Change (negative = reduction)")
