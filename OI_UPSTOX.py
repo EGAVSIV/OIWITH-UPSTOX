@@ -43,6 +43,21 @@ security_id_map = {
     for item in master_data
 }
 
+# --- Extract unique underlyings (IDEA, SBIN, NIFTY, etc.) ---
+unique_symbols = sorted({ item.get("underlying_symbol") for item in master_data if item.get("underlying_symbol") })
+
+# --- Build symbol → underlying_key map ---
+symbol_map = {}
+
+for sym in unique_symbols:
+    for item in master_data:
+        if item.get("underlying_symbol") == sym:
+            uk = item.get("underlying_key")
+            if uk:  # must exist
+                symbol_map[sym] = uk
+            break
+
+
 # ============================================================
 # FETCH OPTION CONTRACTS (EXPIRY LIST)
 # ============================================================
