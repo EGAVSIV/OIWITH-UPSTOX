@@ -22,23 +22,12 @@ def get_expiries(instrument_key):
     url = f"{BASE_URL}/option/contract"
     params = {"instrument_key": instrument_key}
     r = requests.get(url, headers=HEADERS, params=params)
-
-    # DEBUG LINE
-    st.warning(f"API raw response (debug): {r.text[:300]}")
-
     if r.status_code != 200:
         return []
 
-    data = r.json().get("data", [])
-
-    if not data:
-        return []
-
-    df = pd.DataFrame(data)
-    if df.empty:
-        return []
-
+    df = pd.DataFrame(r.json().get("data", []))
     return sorted(df["expiry"].unique())
+
 
 
 
