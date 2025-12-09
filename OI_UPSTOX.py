@@ -45,52 +45,42 @@ def get_option_chain(instrument_key, expiry):
     url = f"{BASE_URL}/option/chain"
     params = {"instrument_key": instrument_key, "expiry_date": expiry}
     r = requests.get(url, headers=HEADERS, params=params)
+
     if r.status_code != 200:
-        st.error(f"Upstox API error: {r.status_code}")
         return pd.DataFrame()
 
     data = r.json().get("data", [])
     rows = []
+
     for row in data:
-        strike = safe_get(row, "strike_price", default=0)
-        spot = safe_get(row, "underlying_spot_price", default=0)
-        pcr = safe_get(row, "pcr", default=0)
+        strike = row["strike_price"]
+        spot = row["underlying_spot_price"]
+        pcr = row["pcr"]
 
-        ce = safe_get(row, "call_options", default={})
-        pe = safe_get(row, "put_options", default={})
+        ce = row["call_options"]
+        pe = row["put_options"]
 
-        # market_data / option_greeks may be missing — use safe_get
         rows.append({
             "Strike": strike,
             "Spot": spot,
             "PCR": pcr,
             # CE
-            "CE_LTP": safe_get(ce, "market_data", "ltp", default=0),
-            "CE_OI": safe_get(ce, "market_data", "oi", default=0),
-            "CE_prev_OI": safe_get(ce, "market_data", "prev_oi", default=0),
-            "CE_IV": safe_get(ce, "option_greeks", "iv", default=0),
-            "CE_Delta": safe_get(ce, "option_greeks", "delta", default=0),
-            "CE_Theta": safe_get(ce, "option_greeks", "theta", default=0),
+            "CE_LTP": ce["market_data"]["ltp"],
+            "CE_OI": ce["market_data"]["oi"],
+            "CE_prev_OI": ce["market_data"]["prev_oi"],
+            "CE_IV": ce["option_greeks"]["iv"],
+            "CE_Delta": ce["option_greeks"]["delta"],
+            "CE_Theta": ce["option_greeks"]["theta"],
             # PE
-            "PE_LTP": safe_get(pe, "market_data", "ltp", default=0),
-            "PE_OI": safe_get(pe, "market_data", "oi", default=0),
-            "PE_prev_OI": safe_get(pe, "market_data", "prev_oi", default=0),
-            "PE_IV": safe_get(pe, "option_greeks", "iv", default=0),
-            "PE_Delta": safe_get(pe, "option_greeks", "delta", default=0),
-            "PE_Theta": safe_get(pe, "option_greeks", "theta", default=0),
+            "PE_LTP": pe["market_data"]["ltp"],
+            "PE_OI": pe["market_data"]["oi"],
+            "PE_prev_OI": pe["market_data"]["prev_oi"],
+            "PE_IV": pe["option_greeks"]["iv"],
+            "PE_Delta": pe["option_greeks"]["delta"],
+            "PE_Theta": pe["option_greeks"]["theta"],
         })
-    df = pd.DataFrame(rows)
 
-    # ensure numeric types and fill NaNs
-    num_cols = [
-        "Strike", "Spot", "PCR",
-        "CE_LTP", "CE_OI", "CE_prev_OI", "CE_IV",
-        "PE_LTP", "PE_OI", "PE_prev_OI", "PE_IV"
-    ]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    return df
+    return pd.DataFrame(rows)
 
 
 # ============================================================
