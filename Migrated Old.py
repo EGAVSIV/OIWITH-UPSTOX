@@ -8,6 +8,7 @@ import streamlit as st
 from typing import Optional
 from tvDatafeed import TvDatafeed, Interval
 import altair as alt
+import gzip
 import hashlib
 
 def hash_pwd(pwd):
@@ -117,7 +118,6 @@ for sym in unique_underlyings:
 if not symbol_map:
     st.error("No underlyings found in master file.")
     st.stop()
-
 # ======================================================
 # BUILD UPSTOX SYMBOL → (SCRIP, SEGMENT) MAP
 # ======================================================
