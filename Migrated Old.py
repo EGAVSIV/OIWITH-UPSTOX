@@ -113,15 +113,19 @@ for sym in unique_underlyings:
     for item in master_data:
         if item.get("underlying_symbol") != sym:
             continue
+
         uk = (
             item.get("underlying_key")
             or item.get("underlyingInstrumentKey")
             or item.get("underlyingInstrument_key")
         )
-        if uk and uk.startswith("NSE_FO|"):
+
+        # ✅ accept ALL valid underlying keys (EQ + FO)
+        if uk:
             symbol_map[sym] = uk
             underlying_meta[sym] = item
             break
+
 
 
 @st.cache_data(ttl=300)
