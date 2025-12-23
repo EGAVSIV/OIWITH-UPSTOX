@@ -11,6 +11,7 @@ import altair as alt
 import gzip
 import json
 import hashlib
+import time
 
 def hash_pwd(pwd):
     return hashlib.sha256(pwd.encode()).hexdigest()
@@ -39,6 +40,31 @@ if not st.session_state.authenticated:
 # STREAMLIT CONFIG
 # ======================================================
 st.set_page_config(page_title="OI + Greeks OTM Scanner", layout="wide")
+# 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
+# =====================================================
+c1, c2, c3 = st.columns([1.2, 1.8, 6])
+
+with c1:
+    if st.button("🔄 Refresh Now"):
+        st.cache_data.clear()
+        st.rerun()
+
+with c2:
+    auto_refresh = st.toggle("⏱ Auto Refresh (5 min)", value=False)
+
+with c3:
+    st.caption("Manual refresh forces fresh NOAA weather + NG demand recalculation")
+# =====================================================
+# AUTO REFRESH TIMER (SAFE)
+# =====================================================
+if auto_refresh:
+    now = time.time()
+    last = st.session_state.get("last_refresh", 0)
+
+    if now - last > 5 * 60:  # 1 minute
+        st.session_state["last_refresh"] = now
+        st.cache_data.clear()
+        st.rerun()
 
 # ======================================================
 # UPSTOX CONFIG
@@ -416,7 +442,7 @@ ALL_SYMBOLS = [
     "BANKNIFTY", "CNXFINANCE", "CNXMIDCAP", "NIFTY", "NIFTYJR", "360ONE", "ABB",
     "ABCAPITAL", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ALKEM",
     "AMBER", "AMBUJACEM", "ANGELONE", "APLAPOLLO", "APOLLOHOSP", "ASHOKLEY",
-    "ASIANPAINT", "ASTRAL", "AUBANK", "AUROPHARMA", "AXISBANK", "BAJAJ_AUTO",
+    "ASIANPAINT", "ASTRAL", "AUBANK", "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO",
     "BAJAJFINSV", "BAJFINANCE", "BANDHANBNK", "BANKBARODA", "BANKINDIA", "BDL",
     "BEL", "BHARATFORG", "BHARTIARTL", "BHEL", "BIOCON", "BLUESTARCO", "BOSCHLTD",
     "BPCL", "BRITANNIA", "BSE", "CAMS", "CANBK", "CDSL", "CGPOWER", "CHOLAFIN",
@@ -425,7 +451,7 @@ ALL_SYMBOLS = [
     "DMART", "DRREDDY", "EICHERMOT", "EXIDEIND", "FEDERALBNK", "GAIL", "GLENMARK",
     "GODREJCP", "GRASIM", "HAL", "HAVELLS", "HCLTECH", "HDFCAMC", "HDFCBANK",
     "HDFCLIFE", "HEROMOTOCO", "HFCL", "HINDALCO", "HINDPETRO", "HINDUNILVR",
-    "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDEA", "IDFCFIRSTB", "IEX", "IGL",
+    "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDEA", "IDFCFIRSTB", "IEX",
     "INDHOTEL", "INDIANB", "INDIGO", "INDUSINDBK", "INFY", "IOC", "IRCTC", "IRFC",
     "ITC", "JINDALSTEL", "JSWSTEEL", "JUBLFOOD", "KOTAKBANK", "KFINTECH",
     "KPITTECH", "LICI", "LT", "LTIM", "LUPIN", "MANAPPURAM", "MARICO", "MARUTI",
