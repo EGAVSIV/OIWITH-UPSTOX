@@ -33,7 +33,24 @@ if not st.session_state.authenticated:
 # ---------------------------- CONFIG ----------------------------
 st.set_page_config(page_title="OTM OI Decay Scanner", layout="wide")
 
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIxMjU5MDciLCJqdGkiOiI2OTQ4ZDJhMWUzYTIyMjQ4YWU4NzQ3ZDUiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY2MzgwMTkzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjY0NDA4MDB9.vQkSMaM1AgMFjjYUQc5xV9JRe8T0XSYfTcvzDqsFUeU"
+# -------------------- LOAD ACCESS TOKEN --------------------
+def load_access_token(path="token.txt"):
+    try:
+        with open(path, "r") as f:
+            token = f.read().strip()
+            if not token:
+                raise ValueError("Empty token file")
+            return token
+    except FileNotFoundError:
+        st.error("❌ token.txt not found. Please add your Upstox access token.")
+        st.stop()
+    except Exception as e:
+        st.error(f"❌ Failed to read access token: {e}")
+        st.stop()
+
+ACCESS_TOKEN = load_access_token()
+
+
 HEADERS = {
     "Accept": "application/json",
     "Authorization": f"Bearer {ACCESS_TOKEN}",
