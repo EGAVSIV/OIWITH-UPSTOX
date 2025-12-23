@@ -105,6 +105,14 @@ except Exception as e:
     st.error(f"Error loading master file: {e}")
     st.stop()
 
+# -------------------- BUILD UNIQUE UNDERLYINGS --------------------
+unique_underlyings = sorted({
+    item.get("underlying_symbol")
+    for item in master_data
+    if item.get("underlying_symbol")
+})
+
+
 
 symbol_map = {}
 underlying_meta = {}
