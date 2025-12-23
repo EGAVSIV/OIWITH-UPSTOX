@@ -87,73 +87,96 @@ def get_close_price(symbol: str) -> Optional[float]:
         return None
     return None
 
-# ======================================================
-# WORKING OPTION CHAIN API (MoneyControl / NiftyTrader Backend)
-# ======================================================
-NT_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
-    "Origin": "https://www.niftytrader.in",
-    "Referer": "https://www.niftytrader.in/",
-}
+# -------------------- LOAD MASTER --------------------
+@st.cache_data(show_spinner=False)
+def load_master_file(path="complete.json.gz"):
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return json.load(f)
 
-@st.cache_data(ttl=20)
-def fetch_oc_json(symbol: str):
-    """
-    Fetch full option chain using MoneyControl backend (used by NiftyTrader).
-    Cached to reduce repeated cloud requests.
-    Returns normalized dict with structure:
-        {"records": {"expiryDates": [...], "data": [...]}}
-    or None on failure.
-    """
-    symbol = symbol.upper().strip()
-    url = (
-        "https://priceapi.moneycontrol.com/techCharts/indianStocks/"
-        f"option/chain?symbol={symbol}"
+try:
+    master_data = load_master_file()
+except FileNotFoundError:
+    st.error("Master file 'complete.json.gz' not found in repo root.")
+    st.stop()
+except Exception as e:
+    st.error(f"Error loading master file: {e}")
+    st.stop()
+
+unique_underlyings = sorted({ item.get("underlying_symbol") for item in master_data if item.get("underlying_symbol") })
+symbol_map = {}
+underlying_meta = {}
+for sym in unique_underlyings:
+    for item in master_data:
+        if item.get("underlying_symbol") != sym:
+            continue
+        uk = item.get("underlying_key") or item.get("underlyingInstrumentKey") or item.get("underlyingInstrument_key")
+        if uk:
+            symbol_map[sym] = uk
+            underlying_meta[sym] = item
+            break
+if not symbol_map:
+    st.error("No underlyings found in master file.")
+    st.stop()
+
+# ======================================================
+# BUILD UPSTOX SYMBOL → (SCRIP, SEGMENT) MAP
+# ======================================================
+SYMBOL_TO_SCRIP = {}
+SYMBOL_TO_SEG = {}
+
+for item in master_data:
+    sym = item.get("underlying_symbol")
+    if not sym:
+        continue
+
+    # Underlying numeric ID (MOST IMPORTANT)
+    scrip = (
+        item.get("underlying_scrip")
+        or item.get("underlyingScrip")
+        or item.get("security_id")
     )
 
-    # simple retry for transient network issues
-    tries = 2
-    for attempt in range(tries):
-        try:
-            r = requests.get(url, headers=NT_HEADERS, timeout=10)
-            r.raise_for_status()
-            js = r.json()
+    # Segment (NSE_EQ / NSE_FO etc.)
+    seg = (
+        item.get("underlying_seg")
+        or item.get("underlyingSeg")
+        or item.get("underlying_segment")
+        or "NSE_EQ"
+    )
 
-            # Some endpoints return expiryDates at root and records.data nested
-            expiry_list = js.get("expiryDates", []) or js.get("records", {}).get("expiryDates", [])
-            data_list = js.get("records", {}).get("data", [])
-            # fallback if structure differs (some responses may embed in 'data' directly)
-            if not data_list and "data" in js:
-                data_list = js.get("data", {}).get("data", []) or js.get("data", [])
+    if sym and scrip:
+        SYMBOL_TO_SCRIP[sym] = int(scrip)
+        SYMBOL_TO_SEG[sym] = seg
 
-            # ensure lists
-            expiry_list = expiry_list or []
-            data_list = data_list or []
+if not SYMBOL_TO_SCRIP:
+    st.error("No valid UnderlyingScrip mapping found in complete.json.gz")
+    st.stop()
 
-            return {
-                "records": {
-                    "expiryDates": expiry_list,
-                    "data": data_list
-                }
-            }
-        except Exception:
-            # backoff between retries
-            if attempt < tries - 1:
-                time.sleep(0.6 * (attempt + 1))
-            else:
-                return None
+
 
 @st.cache_data(ttl=300)
 def get_expiry_list(symbol: str):
-    """
-    SAME return type as before: list[str]
-    """
-    # Map NSE symbol → Upstox instrument_key
-    url = f"{UP_BASE}/option/contract"
-    params = {"instrument_key": f"NSE_EQ|{symbol}"}
+    scrip = SYMBOL_TO_SCRIP.get(symbol)
+    seg = SYMBOL_TO_SEG.get(symbol, "NSE_EQ")
 
-    r = requests.get(url, headers=UP_HEADERS, params=params, timeout=10)
+    if not scrip:
+        return []
+
+    payload = {
+        "UnderlyingScrip": scrip,
+        "UnderlyingSeg": seg
+    }
+
+    try:
+        r = requests.post(
+            f"{UP_BASE}/option/contract",
+            headers=UP_HEADERS,
+            json=payload,
+            timeout=10
+        )
+    except Exception:
+        return []
+
     if r.status_code != 200:
         return []
 
@@ -161,25 +184,29 @@ def get_expiry_list(symbol: str):
     expiries = sorted({d.get("expiry") for d in data if d.get("expiry")})
     return expiries
 
-
-# ======================================================
-# CHAIN BUILDERS (robust)
 @st.cache_data(ttl=20)
 def build_full_chain_table_nt(symbol: str, expiry: Optional[str]):
-    """
-    SAME output columns as MoneyControl version
-    """
+    scrip = SYMBOL_TO_SCRIP.get(symbol)
+    seg = SYMBOL_TO_SEG.get(symbol, "NSE_EQ")
+
+    if not scrip or not expiry:
+        return None
+
     payload = {
-        "instrument_key": f"NSE_EQ|{symbol}",
-        "expiry_date": expiry
+        "UnderlyingScrip": scrip,
+        "UnderlyingSeg": seg,
+        "Expiry": expiry
     }
 
-    r = requests.post(
-        f"{UP_BASE}/option/chain",
-        headers=UP_HEADERS,
-        json=payload,
-        timeout=10
-    )
+    try:
+        r = requests.post(
+            f"{UP_BASE}/option/chain",
+            headers=UP_HEADERS,
+            json=payload,
+            timeout=10
+        )
+    except Exception:
+        return None
 
     if r.status_code != 200:
         return None
