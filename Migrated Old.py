@@ -9,6 +9,7 @@ from typing import Optional
 from tvDatafeed import TvDatafeed, Interval
 import altair as alt
 import gzip
+import json
 import hashlib
 
 def hash_pwd(pwd):
