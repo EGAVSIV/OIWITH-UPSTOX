@@ -2,3 +2,9 @@ streamlit==1.32.0
 requests
 pandas
 plotly
+numpy
+lxml
+bs4
+openpyxl
+tradingview-datafeed
+altair
