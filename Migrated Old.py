@@ -194,6 +194,23 @@ def get_expiry_list(symbol: str):
     return sorted(expiries)
 
 
+# -------------------- SAFE DICT ACCESS --------------------
+def safe_get(d: dict, *keys, default=None):
+    """
+    Safely fetch nested dictionary values.
+    Example: safe_get(obj, 'a', 'b', 'c')
+    """
+    try:
+        for k in keys:
+            if d is None:
+                return default
+            d = d.get(k)
+        return d if d is not None else default
+    except Exception:
+        return default
+
+
+
 
 @st.cache_data(ttl=20)
 def build_full_chain_table_nt(symbol: str, expiry: str):
