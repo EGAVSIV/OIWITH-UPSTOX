@@ -107,64 +107,43 @@ except Exception as e:
 
 
 # ======================================================
-# BUILD UPSTOX SYMBOL → (SCRIP, SEGMENT) MAP
+# BUILD UPSTOX SYMBOL → INSTRUMENT_KEY MAP (CORRECT)
 # ======================================================
-SYMBOL_TO_SCRIP = {}
-SYMBOL_TO_SEG = {}
+SYMBOL_TO_INSTRUMENT = {}
 
 for item in master_data:
-    sym = item.get("underlying_symbol")
-    if not sym:
+    sym = item.get("symbol") or item.get("underlying_symbol")
+    ik = item.get("instrument_key")
+
+    if not sym or not ik:
         continue
 
-    # Underlying numeric ID (MOST IMPORTANT)
-    scrip = (
-        item.get("underlying_scrip")
-        or item.get("underlyingScrip")
-        or item.get("security_id")
-    )
+    # Prefer FO instruments for options
+    if ik.startswith("NSE_FO|"):
+        SYMBOL_TO_INSTRUMENT[sym] = ik
+    elif sym not in SYMBOL_TO_INSTRUMENT:
+        SYMBOL_TO_INSTRUMENT[sym] = ik
 
-    # Segment (NSE_EQ / NSE_FO etc.)
-    seg = (
-        item.get("underlying_seg")
-        or item.get("underlyingSeg")
-        or item.get("underlying_segment")
-        or "NSE_EQ"
-    )
-
-    if sym and scrip:
-        SYMBOL_TO_SCRIP[sym] = int(scrip)
-        SYMBOL_TO_SEG[sym] = seg
-
-if not SYMBOL_TO_SCRIP:
-    st.error("No valid UnderlyingScrip mapping found in complete.json.gz")
+if not SYMBOL_TO_INSTRUMENT:
+    st.error("No valid instrument_key mapping found in complete.json.gz")
     st.stop()
 
 
 
 @st.cache_data(ttl=300)
 def get_expiry_list(symbol: str):
-    scrip = SYMBOL_TO_SCRIP.get(symbol)
-    seg = SYMBOL_TO_SEG.get(symbol) or "NSE_FO"
-
-
-    if not scrip:
+    instrument_key = SYMBOL_TO_INSTRUMENT.get(symbol)
+    if not instrument_key:
         return []
 
-    payload = {
-        "UnderlyingScrip": scrip,
-        "UnderlyingSeg": seg
-    }
+    payload = {"instrument_key": instrument_key}
 
-    try:
-        r = requests.post(
-            f"{UP_BASE}/option/contract",
-            headers=UP_HEADERS,
-            json=payload,
-            timeout=10
-        )
-    except Exception:
-        return []
+    r = requests.get(
+        f"{UP_BASE}/option/contract",
+        headers=UP_HEADERS,
+        params=payload,
+        timeout=10
+    )
 
     if r.status_code != 200:
         return []
@@ -173,71 +152,28 @@ def get_expiry_list(symbol: str):
     expiries = sorted({d.get("expiry") for d in data if d.get("expiry")})
     return expiries
 
+
 @st.cache_data(ttl=20)
 def build_full_chain_table_nt(symbol: str, expiry: Optional[str]):
-    scrip = SYMBOL_TO_SCRIP.get(symbol)
-    seg = SYMBOL_TO_SEG.get(symbol, "NSE_EQ")
+    instrument_key = SYMBOL_TO_INSTRUMENT.get(symbol)
 
-    if not scrip or not expiry:
+    if not instrument_key or not expiry:
         return None
 
     payload = {
-        "UnderlyingScrip": scrip,
-        "UnderlyingSeg": seg,
-        "Expiry": expiry
+        "instrument_key": instrument_key,
+        "expiry_date": expiry
     }
 
-    try:
-        r = requests.post(
-            f"{UP_BASE}/option/chain",
-            headers=UP_HEADERS,
-            json=payload,
-            timeout=10
-        )
-    except Exception:
-        return None
+    r = requests.post(
+        f"{UP_BASE}/option/chain",
+        headers=UP_HEADERS,
+        json=payload,
+        timeout=10
+    )
 
     if r.status_code != 200:
         return None
-
-    rows = []
-    for row in r.json().get("data", []):
-        ce = row.get("call_options", {})
-        pe = row.get("put_options", {})
-
-        rows.append({
-            "Strike": row.get("strike_price"),
-
-            "CE_LTP": ce.get("market_data", {}).get("ltp"),
-            "CE_OI": ce.get("market_data", {}).get("oi"),
-            "CE_Change_OI": ce.get("market_data", {}).get("oi_change"),
-            "CE_pChange_OI": ce.get("market_data", {}).get("oi_change_perc"),
-            "CE_IV": ce.get("option_greeks", {}).get("iv"),
-            "CE_Delta": ce.get("option_greeks", {}).get("delta"),
-            "CE_Vega": ce.get("option_greeks", {}).get("vega"),
-            "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
-            "CE_Theta": ce.get("option_greeks", {}).get("theta"),
-
-            "PE_LTP": pe.get("market_data", {}).get("ltp"),
-            "PE_OI": pe.get("market_data", {}).get("oi"),
-            "PE_Change_OI": pe.get("market_data", {}).get("oi_change"),
-            "PE_pChange_OI": pe.get("market_data", {}).get("oi_change_perc"),
-            "PE_IV": pe.get("option_greeks", {}).get("iv"),
-            "PE_Delta": pe.get("option_greeks", {}).get("delta"),
-            "PE_Vega": pe.get("option_greeks", {}).get("vega"),
-            "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
-            "PE_Theta": pe.get("option_greeks", {}).get("theta"),
-        })
-
-    if not rows:
-        return None
-
-    df = pd.DataFrame(rows)
-    for c in df.columns:
-        if c != "Strike":
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    return df.sort_values("Strike").reset_index(drop=True)
 
 
 def build_compact_chain_table_nt(symbol: str, expiry: Optional[str]):
