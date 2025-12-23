@@ -65,7 +65,8 @@ UP_HEADERS = {
 UP_BASE = "https://api.upstox.com/v2"
 
 st.title("📉 OTM %OI Decay + Full Option Chain (Greeks, Heatmap, Charts)")
-st.caption("Close Price: TradingView (tvDatafeed) | Option Chain & Greeks: NiftyTrader/MoneyControl API")
+st.caption("Close Price: TradingView (tvDatafeed) | Option Chain & Greeks: Upstox API")
+
 
 # ======================================================
 # tvDatafeed (no-login)
@@ -104,21 +105,7 @@ except Exception as e:
     st.error(f"Error loading master file: {e}")
     st.stop()
 
-unique_underlyings = sorted({ item.get("underlying_symbol") for item in master_data if item.get("underlying_symbol") })
-symbol_map = {}
-underlying_meta = {}
-for sym in unique_underlyings:
-    for item in master_data:
-        if item.get("underlying_symbol") != sym:
-            continue
-        uk = item.get("underlying_key") or item.get("underlyingInstrumentKey") or item.get("underlyingInstrument_key")
-        if uk:
-            symbol_map[sym] = uk
-            underlying_meta[sym] = item
-            break
-if not symbol_map:
-    st.error("No underlyings found in master file.")
-    st.stop()
+
 # ======================================================
 # BUILD UPSTOX SYMBOL → (SCRIP, SEGMENT) MAP
 # ======================================================
@@ -158,7 +145,8 @@ if not SYMBOL_TO_SCRIP:
 @st.cache_data(ttl=300)
 def get_expiry_list(symbol: str):
     scrip = SYMBOL_TO_SCRIP.get(symbol)
-    seg = SYMBOL_TO_SEG.get(symbol, "NSE_EQ")
+    seg = SYMBOL_TO_SEG.get(symbol) or "NSE_FO"
+
 
     if not scrip:
         return []
