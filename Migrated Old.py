@@ -135,6 +135,35 @@ for sym in unique_underlyings:
             break
 
 
+# -------------------- HELPERS --------------------
+def ts_to_ymd(v):
+    """
+    Converts expiry values from Upstox (string / timestamp / ms)
+    into YYYY-MM-DD string.
+    """
+    if v is None:
+        return None
+
+    # Already a string date
+    if isinstance(v, str):
+        try:
+            return pd.to_datetime(v).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    # Timestamp (seconds or milliseconds)
+    try:
+        iv = int(v)
+        if iv > 1e10:  # milliseconds
+            dt = pd.to_datetime(iv, unit="ms")
+        else:          # seconds
+            dt = pd.to_datetime(iv, unit="s")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+
 
 @st.cache_data(ttl=300)
 def get_expiry_list(symbol: str):
