@@ -8,6 +8,7 @@ import gzip
 import json
 from datetime import datetime
 import hashlib
+import time
 
 def hash_pwd(pwd):
     return hashlib.sha256(pwd.encode()).hexdigest()
@@ -34,6 +35,32 @@ if not st.session_state.authenticated:
 
 # -------------------- CONFIG --------------------
 st.set_page_config(page_title="Upstox Option Chain Analysis", layout="wide")
+
+# 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
+# =====================================================
+c1, c2, c3 = st.columns([1.2, 1.8, 6])
+
+with c1:
+    if st.button("🔄 Refresh Now"):
+        st.cache_data.clear()
+        st.rerun()
+
+with c2:
+    auto_refresh = st.toggle("⏱ Auto Refresh (30 min)", value=False)
+
+with c3:
+    st.caption("Manual refresh forces fresh NOAA weather + NG demand recalculation")
+# =====================================================
+# AUTO REFRESH TIMER (SAFE)
+# =====================================================
+if auto_refresh:
+    now = time.time()
+    last = st.session_state.get("last_refresh", 0)
+
+    if now - last > 30 * 60:  # 30 minutes
+        st.session_state["last_refresh"] = now
+        st.cache_data.clear()
+        st.rerun()
 # -------------------- LOAD ACCESS TOKEN --------------------
 def load_access_token(path="token.txt"):
     try:
