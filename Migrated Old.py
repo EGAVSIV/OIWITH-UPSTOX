@@ -39,7 +39,7 @@ if not st.session_state.authenticated:
 # ======================================================
 # STREAMLIT CONFIG
 # ======================================================
-st.set_page_config(page_title="OI + Greeks OTM Scanner", layout="wide")
+st.set_page_config(page_title="OI + Greeks OTM Scanner", layout="wide",page_icon="🚦")
 # 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
 # =====================================================
 c1, c2, c3 = st.columns([1.2, 1.8, 6])
