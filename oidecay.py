@@ -32,7 +32,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ---------------------------- CONFIG ----------------------------
-st.set_page_config(page_title="OTM OI Decay Scanner", layout="wide")
+st.set_page_config(page_title="OTM OI Decay Scanner", layout="wide",page_icon="🚦")
 
 # 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
 # =====================================================
