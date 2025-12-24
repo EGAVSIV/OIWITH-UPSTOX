@@ -34,7 +34,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # -------------------- CONFIG --------------------
-st.set_page_config(page_title="Upstox Option Chain Analysis", layout="wide")
+st.set_page_config(page_title="Upstox Option Chain Analysis", layout="wide",page_icon="🚦")
 
 # 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
 # =====================================================
