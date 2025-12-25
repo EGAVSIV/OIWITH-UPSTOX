@@ -20,7 +20,7 @@ beautifulsoup4>=4.12.3
 lxml==4.9.3
 
 # -------- TRADINGVIEW (UNSTABLE) --------
-#tradingview-datafeed>=2.1.0
+tradingview-datafeed
 
 # -------- STREAMLIT INTERNALS (PINNED SAFE) --------
 rich==14.2.0
