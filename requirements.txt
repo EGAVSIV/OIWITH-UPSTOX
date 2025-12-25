@@ -6,6 +6,6 @@ pandas==2.1.4
 
 altair==5.2.0
 
-tradingvie tvDatafeed
+tradingview-datafeed
 
 openpyxl==3.1.5
