@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 from typing import Optional
 from io import BytesIO
+import os 
 
 # ============================================================
 # STREAMLIT CONFIG
@@ -30,15 +31,25 @@ st.caption("Pure Gamma | ITM-3 | High Convexity Option Trades")
 # ============================================================
 UP_BASE = "https://api.upstox.com/v2"
 
-def load_access_token(path="token.txt"):
+def load_access_token():
+    token_path = "token.txt"  # relative path only
+
+    if not os.path.exists(token_path):
+        st.error("❌ token.txt not found in repository root")
+        st.stop()
+
     try:
-        with open(path, "r") as f:
+        with open(token_path, "r", encoding="utf-8") as f:
             token = f.read().strip()
-            if not token:
-                raise ValueError("Empty token")
-            return token
+
+        if not token:
+            st.error("❌ token.txt is empty")
+            st.stop()
+
+        return token
+
     except Exception as e:
-        st.error(f"Upstox token error: {e}")
+        st.error(f"❌ Failed to read token.txt: {e}")
         st.stop()
 
 ACCESS_TOKEN = load_access_token()
