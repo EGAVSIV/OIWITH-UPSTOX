@@ -1,13 +1,6 @@
 streamlit==1.35.0
-
 requests==2.31.0
-numpy==1.26.4
-pandas==2.1.4
-
-altair==5.2.0
-
-
-openpyxl==3.1.5
-
+pandas==2.2.2
+plotly==5.22.0
 tradingview-datafeed
 
