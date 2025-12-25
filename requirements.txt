@@ -1,24 +1,18 @@
-# -------- CORE STREAMLIT --------
 streamlit==1.35.0
 
-# -------- DATA --------
 requests==2.31.0
 numpy==1.26.4
 pandas==2.1.4
 
-# -------- VISUALIZATION --------
 plotly==5.19.0
 altair==5.2.0
 
-# -------- EXCEL / FILES --------
 openpyxl==3.1.5
 xlsxwriter==3.1.9
 
-# -------- HTML / PARSING --------
 beautifulsoup4==4.12.3
 lxml==4.9.3
 
-# -------- STREAMLIT INTERNALS --------
 rich==14.2.0
 markdown-it-py==4.0.0
 mdurl==0.1.2
