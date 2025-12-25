@@ -8,3 +8,14 @@ bs4
 openpyxl
 tradingview-datafeed
 altair
+streamlit>=1.33
+
+pandas>=2.0
+numpy>=1.26
+
+requests>=2.31
+
+tvDatafeed>=2.1
+
+altair>=5.0
+xlsxwriter>=3.1
