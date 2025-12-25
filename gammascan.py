@@ -32,25 +32,25 @@ st.caption("Pure Gamma | ITM-3 | High Convexity Option Trades")
 UP_BASE = "https://api.upstox.com/v2"
 
 def load_access_token():
-    token_path = "token.txt"  # relative path only
+    # First try Streamlit secrets
+    if "UPSTOX_TOKEN" in st.secrets:
+        return st.secrets["UPSTOX_TOKEN"]
 
+    # Fallback to local file
+    token_path = "token.txt"
     if not os.path.exists(token_path):
-        st.error("❌ token.txt not found in repository root")
+        st.error("❌ token.txt not found and UPSTOX_TOKEN not set")
         st.stop()
 
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            token = f.read().strip()
+    with open(token_path, "r", encoding="utf-8") as f:
+        token = f.read().strip()
 
-        if not token:
-            st.error("❌ token.txt is empty")
-            st.stop()
-
-        return token
-
-    except Exception as e:
-        st.error(f"❌ Failed to read token.txt: {e}")
+    if not token:
+        st.error("❌ Access token is empty")
         st.stop()
+
+    return token
+
 
 ACCESS_TOKEN = load_access_token()
 
@@ -64,8 +64,17 @@ UP_HEADERS = {
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_master(path="complete.json.gz"):
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        return json.load(f)
+    if not os.path.exists(path):
+        st.error("❌ complete.json.gz not found in repository root")
+        st.stop()
+
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"❌ Failed to read master file: {e}")
+        st.stop()
+
 
 master_data = load_master()
 
