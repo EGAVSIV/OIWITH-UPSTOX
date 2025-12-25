@@ -4,16 +4,8 @@ requests==2.31.0
 numpy==1.26.4
 pandas==2.1.4
 
-plotly==5.19.0
 altair==5.2.0
 
+tradingvie tvDatafeed
+
 openpyxl==3.1.5
-xlsxwriter==3.1.9
-
-beautifulsoup4==4.12.3
-lxml==4.9.3
-
-rich==14.2.0
-markdown-it-py==4.0.0
-mdurl==0.1.2
-pygments==2.19.2
