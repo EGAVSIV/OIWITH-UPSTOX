@@ -1,5 +1,5 @@
 # ============================================================
-# FUTURES MARKET DEPTH SCANNER (USING SYMBOL KEYS)
+# FUTURES MARKET DEPTH SCANNER (USING SYMBOL FIELD ONLY)
 # ============================================================
 
 import streamlit as st
@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("📊 Futures Market Depth Scanner (REST Depth Snapshot)")
-st.caption("Uses market-quote/quotes with NSE_FO:SYMBOLFUT keys and depth + total bid/ask filters.")
+st.caption("Uses market-quote/quotes with NSE_FO:SYMBOL keys and depth + total bid/ask filters.")
 
 BASE_URL = "https://api.upstox.com/v2"
 
@@ -53,17 +53,8 @@ HEADERS = {
 @st.cache_data(show_spinner=False)
 def load_fut_map():
     """
-    Build: Symbol → REST market-quote key like 'NSE_FO:EXIDEIND26FEBFUT'.
-
-    complete.json.gz row example you provided:
-    {
-      'segment': 'NSE_FO',
-      'instrument_type': 'FUT',
-      'trading_symbol': 'EXIDEIND FUT 24 FEB 26',
-      'asset_symbol': 'EXIDEIND',
-      ...
-    }
-    We must derive 'EXIDEIND26FEBFUT' from trading_symbol.[web:4][web:92]
+    Build: Underlying symbol → market-quote key 'NSE_FO:SYMBOLFUT'
+    using 'symbol' field that matches what full-quote returns.[web:92]
     """
     if not os.path.isfile("complete.json.gz"):
         st.error("❌ complete.json.gz not found")
@@ -80,32 +71,13 @@ def load_fut_map():
             continue
 
         under_sym = item.get("underlying_symbol") or item.get("asset_symbol")
-        tsym = item.get("trading_symbol")  # e.g. 'EXIDEIND FUT 24 FEB 26'
+        # This is the exact symbol used by full-quote: e.g. 'EXIDEIND26FEBFUT'[web:92]
+        symbol_field = item.get("symbol")
 
-        if not under_sym or not tsym:
+        if not under_sym or not symbol_field:
             continue
 
-        # Convert trading_symbol to symbol-style FUT key:
-        # 'EXIDEIND FUT 24 FEB 26' → 'EXIDEIND26FEBFUT'
-        parts = tsym.split()
-        # [0] underlying, [1] 'FUT', [2] year, [3] month, [4] day  OR  [0] underlying, [1] FUT, [2] month, [3] year, [4] day
-        # Your example symbol in API: EXIDEIND26FEBFUT, so pattern is:
-        # under_sym + DD + MON + FUT
-        # Extract day and month tokens from trading_symbol
-        # e.g. 'EXIDEIND FUT 24 FEB 26' → day='24', mon='FEB'
-        day = None
-        mon = None
-        for p in parts:
-            if p.isdigit() and len(p) <= 2:
-                day = p
-            elif p.isalpha() and len(p) == 3:
-                mon = p.upper()
-
-        if not day or not mon:
-            continue
-
-        fut_symbol = f"{under_sym}{day}{mon}FUT"
-        mk_key = f"NSE_FO:{fut_symbol}"
+        mk_key = f"NSE_FO:{symbol_field}"
 
         if under_sym not in fut_map:
             fut_map[under_sym] = mk_key
@@ -144,7 +116,6 @@ def get_full_quotes(instrument_keys):
         st.write("Raw response:", resp.text)
         return {}
 
-    # Debug once:
     st.write("Full-quote status:", resp.status_code)
     st.write("Sample keys in data:", list(j.get("data", {}).keys())[:5])
 
@@ -163,7 +134,7 @@ def parse_one(sym, mk_key, rec):
     total_bid = sum(l.get("quantity", 0) for l in buy_levels)
     total_ask = sum(l.get("quantity", 0) for l in sell_levels)
 
-    # Also use total_buy_quantity / total_sell_quantity as aggregate.[web:92]
+    # Also use aggregate totals as backup.[web:92]
     total_bid = total_bid or rec.get("total_buy_quantity", 0)
     total_ask = total_ask or rec.get("total_sell_quantity", 0)
 
@@ -255,10 +226,10 @@ if do_run:
                 ascending=[False, False]
             ).head(20)
 
-            # New-entry alert
             prev = st.session_state["prev_top20_md"]
             new_rows = df_sorted.copy()
 
+            # New-entry alert
             if not prev.empty:
                 prev_keys = set(zip(prev["Symbol"], prev["MarketKey"]))
                 new_keys = set(zip(new_rows["Symbol"], new_rows["MarketKey"]))
