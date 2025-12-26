@@ -1,45 +1,44 @@
 # ============================================================
-# GAMMA BUYER DOMINANCE & GAMMA EXPANSION SCANNER (FINAL FIXED)
-# SELECT ALL → TOP 20 STRIKES | ITM / OTM FILTER
+# GAMMA EXPANSION & BUYER DOMINANCE SCANNER (PRO)
+# Auto Refresh | Top 20 Gamma Strikes | Alerts
 # ============================================================
 
 import streamlit as st
-import requests
+import requests, gzip, json, time
 import pandas as pd
 import numpy as np
-import gzip, json, time
-from io import BytesIO
 from datetime import datetime
 
 # ============================================================
 # STREAMLIT CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="Gamma Buyer Dominance Scanner",
+    page_title="Gamma Expansion Scanner",
     page_icon="⚡",
     layout="wide"
 )
 
-st.title("⚡ Gamma Buyer Dominance Scanner")
-st.caption("ATM Buyer Dominance | Select All → Top 20 Gamma Expansion Strikes")
+st.title("⚡ Gamma Expansion & Buyer Dominance Scanner")
+st.caption("Pure Gamma × OI × Price | Institutional Move Detector")
 
 BASE_URL = "https://api.upstox.com/v2"
 
 # ============================================================
-# ACCESS TOKEN (ONLY token.txt OR secrets)
+# AUTO REFRESH (5 MIN)
+# ============================================================
+AUTO_REFRESH_SEC = 300
+now = time.time()
+last = st.session_state.get("last_refresh", 0)
+if now - last > AUTO_REFRESH_SEC:
+    st.session_state["last_refresh"] = now
+    st.cache_data.clear()
+
+# ============================================================
+# ACCESS TOKEN
 # ============================================================
 def load_token():
-    if "UPSTOX_TOKEN" in st.secrets:
-        return st.secrets["UPSTOX_TOKEN"]
-    try:
-        with open("token.txt", "r") as f:
-            token = f.read().strip()
-            if not token:
-                raise ValueError("Empty token")
-            return token
-    except Exception:
-        st.error("❌ token.txt not found or empty")
-        st.stop()
+    with open("token.txt") as f:
+        return f.read().strip()
 
 HEADERS = {
     "Accept": "application/json",
@@ -48,58 +47,32 @@ HEADERS = {
 }
 
 # ============================================================
-# LOAD MASTER (FIXED — ROOT CAUSE)
+# LOAD MASTER (ROBUST)
 # ============================================================
 @st.cache_data(show_spinner=False)
-def build_symbol_map():
-    try:
-        with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
-            master = json.load(f)
-    except Exception as e:
-        st.error(f"Failed to load complete.json.gz: {e}")
-        st.stop()
+def load_symbol_map():
+    with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
+        master = json.load(f)
 
-    symbol_map = {}
-
-    for item in master:
-        sym = item.get("underlying_symbol")
+    smap = {}
+    for x in master:
+        sym = x.get("underlying_symbol")
         uk = (
-            item.get("underlying_key")
-            or item.get("underlyingInstrumentKey")
-            or item.get("underlyingInstrument_key")
+            x.get("underlying_key")
+            or x.get("underlyingInstrumentKey")
+            or x.get("underlyingInstrument_key")
         )
+        if sym and uk and str(uk).startswith("NSE_FO"):
+            smap.setdefault(sym, uk)
+    return dict(sorted(smap.items()))
 
-        if not sym or not uk:
-            continue
-
-        if str(uk).startswith("NSE_FO"):
-            symbol_map.setdefault(sym, uk)
-
-    return dict(sorted(symbol_map.items()))
-
-SYMBOL_MAP = build_symbol_map()
-ALL_SYMBOLS = list(SYMBOL_MAP.keys())
-
-st.caption(f"🧪 System Check — Symbols loaded: {len(ALL_SYMBOLS)}")
-
-if not ALL_SYMBOLS:
-    st.error("❌ No symbols available. Check complete.json.gz structure.")
-    st.stop()
+SYMBOL_MAP = load_symbol_map()
+symbols = list(SYMBOL_MAP.keys())
 
 # ============================================================
-# SAFE EXPIRY CONVERSION
+# API CALLS
 # ============================================================
-def safe_expiry(raw):
-    try:
-        if isinstance(raw, str):
-            return pd.to_datetime(raw).strftime("%Y-%m-%d")
-        if raw > 1e12:
-            return datetime.utcfromtimestamp(raw / 1000).strftime("%Y-%m-%d")
-        return datetime.utcfromtimestamp(raw).strftime("%Y-%m-%d")
-    except Exception:
-        return None
-
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def get_expiries(inst):
     r = requests.get(
         f"{BASE_URL}/option/contract",
@@ -107,20 +80,11 @@ def get_expiries(inst):
         params={"instrument_key": inst},
         timeout=10
     )
-    if r.status_code != 200:
-        return []
+    return sorted({
+        pd.to_datetime(d["expiry"]).strftime("%Y-%m-%d")
+        for d in r.json().get("data", []) if d.get("expiry")
+    })
 
-    expiries = set()
-    for d in r.json().get("data", []):
-        e = safe_expiry(d.get("expiry"))
-        if e:
-            expiries.add(e)
-
-    return sorted(expiries)
-
-# ============================================================
-# OPTION CHAIN
-# ============================================================
 def get_chain(inst, expiry):
     r = requests.get(
         f"{BASE_URL}/option/chain",
@@ -128,16 +92,12 @@ def get_chain(inst, expiry):
         params={"instrument_key": inst, "expiry_date": expiry},
         timeout=10
     )
-    if r.status_code != 200:
-        return pd.DataFrame()
-
     rows = []
     for x in r.json().get("data", []):
-        ce = x.get("call_options") or {}
-        pe = x.get("put_options") or {}
-
+        ce, pe = x.get("call_options", {}), x.get("put_options", {})
         rows.append({
             "Strike": x.get("strike_price"),
+            "Spot": x.get("underlying_spot_price"),
             "CE_LTP": ce.get("market_data", {}).get("ltp"),
             "CE_OI": ce.get("market_data", {}).get("oi"),
             "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
@@ -145,146 +105,83 @@ def get_chain(inst, expiry):
             "PE_OI": pe.get("market_data", {}).get("oi"),
             "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
         })
-
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    return df.dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
+    return df.apply(pd.to_numeric, errors="coerce").dropna()
 
 # ============================================================
-# ITM / OTM FILTER
+# GAMMA ANALYSIS ENGINE
 # ============================================================
-def apply_moneyness_filter(df, mode):
-    if df.empty:
-        return df
-
-    atm_idx = len(df) // 2
-    atm_strike = df.iloc[atm_idx]["Strike"]
-
-    if mode == "ITM":
-        return df[df["Strike"] <= atm_strike]
-    if mode == "OTM":
-        return df[df["Strike"] >= atm_strike]
-    return df
-
-# ============================================================
-# ATM BUYER DOMINANCE (SINGLE SYMBOL MODE)
-# ============================================================
-def decide_buyer(df):
-    if len(df) < 5:
-        return None
-
-    atm = df.iloc[len(df) // 2]
-
-    ce = atm["CE_LTP"] * atm["CE_Gamma"] * atm["CE_OI"]
-    pe = atm["PE_LTP"] * atm["PE_Gamma"] * atm["PE_OI"]
-
-    if pd.isna(ce) or pd.isna(pe):
-        return None
-
-    if ce > pe * 1.10:
-        return {"Side": "CALL", "Strike": int(atm["Strike"]), "GammaScore": ce}
-    if pe > ce * 1.10:
-        return {"Side": "PUT", "Strike": int(atm["Strike"]), "GammaScore": pe}
-
-    return None
-
-# ============================================================
-# TOP GAMMA EXPANSION (SELECT ALL MODE)
-# ============================================================
-def top_gamma_strikes(df, symbol, expiry, top_n=20):
-    if df.empty:
-        return []
-
+def gamma_engine(df, symbol, expiry):
     df = df.copy()
+
+    # Gamma Exposure
     df["CE_GEX"] = df["CE_LTP"] * df["CE_Gamma"] * df["CE_OI"]
     df["PE_GEX"] = df["PE_LTP"] * df["PE_Gamma"] * df["PE_OI"]
 
     df["GammaExp"] = df[["CE_GEX", "PE_GEX"]].max(axis=1)
     df["Side"] = np.where(df["CE_GEX"] > df["PE_GEX"], "CALL", "PUT")
 
-    df = df.dropna(subset=["GammaExp"])
+    spot = df["Spot"].iloc[0]
+    df["OTM_Dist"] = abs(df["Strike"] - spot)
+
+    # Alerts
+    df["Alert"] = ""
+
+    # Stop Hunt Zone
+    df.loc[
+        (df["OTM_Dist"] > spot * 0.01) & (df["GammaExp"] > df["GammaExp"].quantile(0.85)),
+        "Alert"
+    ] = "🟣 Stop-Hunt Zone"
+
+    # Buyer Dominance
+    df.loc[
+        abs(df["CE_GEX"] - df["PE_GEX"]) > df["GammaExp"] * 0.25,
+        "Alert"
+    ] += " 🔥 Buyer Dominance"
+
+    # Fake Breakout
+    df["GammaChange"] = df["GammaExp"].pct_change()
+    df.loc[df["GammaChange"] < -0.4, "Alert"] += " ⚠ Fake Breakout"
+
+    # Trend Reversal
+    df["PrevSide"] = df["Side"].shift(1)
+    df.loc[df["Side"] != df["PrevSide"], "Alert"] += " 🔄 Gamma Flip"
+
     df["Symbol"] = symbol
     df["Expiry"] = expiry
 
     return (
         df.sort_values("GammaExp", ascending=False)
-        .head(top_n)
-        [["Symbol", "Expiry", "Strike", "Side", "GammaExp"]]
-        .to_dict("records")
+        .head(20)
+        [["Symbol", "Expiry", "Strike", "Side", "GammaExp", "Alert"]]
     )
 
 # ============================================================
 # UI
 # ============================================================
-st.markdown("### 🔎 Symbol Selection")
+symbol = st.selectbox("Select Symbol", symbols)
+expiry = st.selectbox("Select Expiry", get_expiries(SYMBOL_MAP[symbol]))
 
-select_all = st.checkbox("✅ Select All Symbols")
-
-symbols = ALL_SYMBOLS if select_all else st.multiselect(
-    "Symbols",
-    ALL_SYMBOLS,
-    default=ALL_SYMBOLS[:1]
-)
-
-moneyness = st.radio("Strike Filter", ["ALL", "ITM", "OTM"], horizontal=True)
-
-expiry = None
-if symbols:
-    expiry_list = get_expiries(SYMBOL_MAP[symbols[0]])
-    if expiry_list:
-        expiry = st.selectbox("Expiry", expiry_list)
-    else:
-        st.warning("No expiries available")
-
-run_scan = st.button("🚀 Run Gamma Scan")
+run = st.button("🚀 Scan Gamma")
 
 # ============================================================
-# MAIN EXECUTION
+# EXECUTION
 # ============================================================
-if run_scan and symbols and expiry:
+if run:
+    df = get_chain(SYMBOL_MAP[symbol], expiry)
+    out = gamma_engine(df, symbol, expiry)
 
-    results = []
+    st.success("Top Gamma Expansion Strikes")
+    st.dataframe(out, use_container_width=True)
 
-    with st.spinner("Scanning Gamma Expansion…"):
-        for sym in symbols:
-            df = get_chain(SYMBOL_MAP[sym], expiry)
-            df = apply_moneyness_filter(df, moneyness)
-
-            if select_all:
-                results.extend(top_gamma_strikes(df, sym, expiry))
-            else:
-                d = decide_buyer(df)
-                if d:
-                    results.append({
-                        "Symbol": sym,
-                        "Expiry": expiry,
-                        "Strike": d["Strike"],
-                        "Side": d["Side"],
-                        "GammaExp": d["GammaScore"]
-                    })
-
-            time.sleep(0.12)
-
-    if results:
-        out = pd.DataFrame(results).sort_values("GammaExp", ascending=False)
-        st.success("✅ Gamma Expansion Found")
-        st.dataframe(out, use_container_width=True)
-
-        buf = BytesIO()
-        out.to_excel(buf, index=False)
-        buf.seek(0)
-
-        st.download_button("📥 Download Excel", buf, "gamma_expansion.xlsx")
-    else:
-        st.warning("No strong Gamma Expansion detected")
+    # Alerts
+    alerts = out[out["Alert"] != ""]
+    if not alerts.empty:
+        st.warning("⚠ Active Gamma Alerts")
+        st.table(alerts[["Strike", "Side", "Alert"]])
 
 # ============================================================
 # FOOTER
 # ============================================================
 st.markdown("---")
-st.markdown("**Designed by: Gaurav Singh Yadav**  \nQuant | Options | Gamma Intelligence")
+st.markdown("**Designed by: Gaurav Singh Yadav**  \nOptions | Gamma | Institutional Flow")
