@@ -1,6 +1,6 @@
 # ============================================================
-# GAMMA BUYER DOMINANCE & GAMMA EXPANSION SCANNER (FINAL FIXED)
-# SYMBOL LOADING MATCHES WORKING APP
+# GAMMA BUYER DOMINANCE & GAMMA EXPANSION SCANNER (FINAL)
+# SELECT ALL → TOP 20 STRIKES | ITM / OTM FILTER
 # ============================================================
 
 import streamlit as st
@@ -31,76 +31,35 @@ BASE_URL = "https://api.upstox.com/v2"
 def load_token():
     if "UPSTOX_TOKEN" in st.secrets:
         return st.secrets["UPSTOX_TOKEN"]
-    try:
-        with open("token.txt") as f:
-            return f.read().strip()
-    except:
-        st.error("❌ token.txt not found")
-        st.stop()
+    with open("token.txt") as f:
+        return f.read().strip()
 
 HEADERS = {
     "Accept": "application/json",
     "Authorization": f"Bearer {load_token()}",
-    "User-Agent": "Mozilla/5.0"
 }
 
 # ============================================================
-# LOAD MASTER (SAME AS WORKING APP)
+# LOAD MASTER
 # ============================================================
-@st.cache_data(show_spinner=False)
-def load_master_file(path="complete.json.gz"):
-    with gzip.open(path, "rt", encoding="utf-8") as f:
+@st.cache_data
+def load_master():
+    with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
         return json.load(f)
 
-try:
-    master = load_master_file()
-except FileNotFoundError:
-    st.error("❌ complete.json.gz NOT FOUND in repo root")
-    st.stop()
-except Exception as e:
-    st.error(f"❌ Error loading master file: {e}")
-    st.stop()
+master = load_master()
 
-# ============================================================
-# BUILD SYMBOL MAP (CRITICAL FIX)
-# ============================================================
 SYMBOL_MAP = {}
-UNDERLYING_META = {}
-
-for item in master:
-    sym = item.get("underlying_symbol")
-    if not sym:
-        continue
-
-    uk = (
-        item.get("underlying_key")
-        or item.get("underlyingInstrumentKey")
-        or item.get("underlyingInstrument_key")
-    )
-
-    if not uk:
-        continue
-
-    if str(uk).startswith("NSE_FO"):
-        if sym not in SYMBOL_MAP:
-            SYMBOL_MAP[sym] = uk
-            UNDERLYING_META[sym] = item
+for x in master:
+    sym = x.get("underlying_symbol")
+    uk = x.get("underlying_key")
+    if sym and uk and uk.startswith("NSE_FO") and sym not in SYMBOL_MAP:
+        SYMBOL_MAP[sym] = uk
 
 ALL_SYMBOLS = sorted(SYMBOL_MAP.keys())
 
 # ============================================================
-# SYSTEM CHECK (VISIBLE)
-# ============================================================
-st.markdown("### 🧪 System Check")
-st.write("Master records:", len(master))
-st.write("Symbols loaded:", len(ALL_SYMBOLS))
-
-if not ALL_SYMBOLS:
-    st.error("❌ No symbols available even after schema fix")
-    st.stop()
-
-# ============================================================
-# SAFE EXPIRY HANDLER
+# SAFE EXPIRY CONVERSION
 # ============================================================
 def safe_expiry(raw):
     try:
@@ -112,27 +71,26 @@ def safe_expiry(raw):
     except:
         return None
 
-@st.cache_data(ttl=600, show_spinner=False)
-def get_expiries(instrument_key):
+@st.cache_data(ttl=600)
+def get_expiries(inst):
     r = requests.get(
         f"{BASE_URL}/option/contract",
         headers=HEADERS,
-        params={"instrument_key": instrument_key},
+        params={"instrument_key": inst},
         timeout=10
     )
     if r.status_code != 200:
         return []
 
-    expiries = set()
-    for item in r.json().get("data", []):
-        e = safe_expiry(item.get("expiry") or item.get("expiryDate"))
+    out = []
+    for d in r.json().get("data", []):
+        e = safe_expiry(d.get("expiry"))
         if e:
-            expiries.add(e)
-
-    return sorted(expiries)
+            out.append(e)
+    return sorted(set(out))
 
 # ============================================================
-# OPTION CHAIN
+# OPTION CHAIN (SAFE)
 # ============================================================
 def get_chain(inst, expiry):
     r = requests.get(
@@ -166,36 +124,65 @@ def get_chain(inst, expiry):
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return df.dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
+    df = df.dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
+    return df
 
 # ============================================================
 # ITM / OTM FILTER
 # ============================================================
-def apply_moneyness(df, mode):
+def apply_moneyness_filter(df, mode):
     if df.empty:
         return df
-    atm = df.iloc[len(df) // 2]["Strike"]
+
+    atm_idx = len(df) // 2
+    atm_strike = df.iloc[atm_idx]["Strike"]
+
     if mode == "ITM":
-        return df[df["Strike"] <= atm]
-    if mode == "OTM":
-        return df[df["Strike"] >= atm]
-    return df
+        return df[df["Strike"] <= atm_strike]
+    elif mode == "OTM":
+        return df[df["Strike"] >= atm_strike]
+
+    return df  # ALL
 
 # ============================================================
-# GAMMA EXPANSION (STRIKE LEVEL)
+# ATM BUYER DOMINANCE (SINGLE SYMBOL)
 # ============================================================
-def top_gamma_strikes(df, sym, expiry, top_n=20):
+def decide_buyer(df):
+    if len(df) < 5:
+        return None
+
+    atm = df.iloc[len(df) // 2]
+
+    ce = atm["CE_LTP"] * atm["CE_Gamma"] * atm["CE_OI"]
+    pe = atm["PE_LTP"] * atm["PE_Gamma"] * atm["PE_OI"]
+
+    if pd.isna(ce) or pd.isna(pe):
+        return None
+
+    if ce > pe * 1.10:
+        return {"Side": "CALL", "Strike": int(atm["Strike"]), "GammaScore": ce}
+    if pe > ce * 1.10:
+        return {"Side": "PUT", "Strike": int(atm["Strike"]), "GammaScore": pe}
+
+    return None
+
+# ============================================================
+# TOP GAMMA EXPANSION (SELECT ALL)
+# ============================================================
+def top_gamma_strikes(df, symbol, expiry, top_n=20):
     if df.empty:
         return []
 
     df = df.copy()
     df["CE_GEX"] = df["CE_LTP"] * df["CE_Gamma"] * df["CE_OI"]
     df["PE_GEX"] = df["PE_LTP"] * df["PE_Gamma"] * df["PE_OI"]
+
     df["GammaExp"] = df[["CE_GEX", "PE_GEX"]].max(axis=1)
     df["Side"] = np.where(df["CE_GEX"] > df["PE_GEX"], "CALL", "PUT")
 
     df = df.dropna(subset=["GammaExp"])
-    df["Symbol"] = sym
+
+    df["Symbol"] = symbol
     df["Expiry"] = expiry
 
     return (
@@ -215,7 +202,7 @@ select_all = st.checkbox("✅ Select All Symbols")
 symbols = ALL_SYMBOLS if select_all else st.multiselect(
     "Symbols",
     ALL_SYMBOLS,
-    default=[ALL_SYMBOLS[0]]
+    default=ALL_SYMBOLS[:1]
 )
 
 moneyness = st.radio("Strike Filter", ["ALL", "ITM", "OTM"], horizontal=True)
@@ -231,29 +218,44 @@ if symbols:
 run_scan = st.button("🚀 Run Gamma Scan")
 
 # ============================================================
-# EXECUTION
+# MAIN EXECUTION
 # ============================================================
 if run_scan and symbols and expiry:
+
     results = []
 
     with st.spinner("Scanning Gamma Expansion…"):
         for sym in symbols:
             df = get_chain(SYMBOL_MAP[sym], expiry)
-            df = apply_moneyness(df, moneyness)
-            results.extend(top_gamma_strikes(df, sym, expiry))
+            df = apply_moneyness_filter(df, moneyness)
+
+            if select_all:
+                results.extend(top_gamma_strikes(df, sym, expiry))
+            else:
+                d = decide_buyer(df)
+                if d:
+                    results.append({
+                        "Symbol": sym,
+                        "Expiry": expiry,
+                        "Strike": d["Strike"],
+                        "Side": d["Side"],
+                        "GammaExp": d["GammaScore"]
+                    })
+
             time.sleep(0.12)
 
     if results:
         out = pd.DataFrame(results).sort_values("GammaExp", ascending=False)
         st.success("✅ Gamma Expansion Found")
-        st.dataframe(out, use_container_width=True)
+        st.dataframe(out, width="stretch")
 
         buf = BytesIO()
         out.to_excel(buf, index=False)
         buf.seek(0)
+
         st.download_button("📥 Download Excel", buf, "gamma_expansion.xlsx")
     else:
-        st.warning("No Gamma Expansion detected")
+        st.warning("No strong Gamma Expansion detected")
 
 # ============================================================
 # FOOTER
