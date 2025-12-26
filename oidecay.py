@@ -1,231 +1,323 @@
-# ============================================================
-# GAMMA PREMIUM EXPANSION SCANNER
-# BASED ON WORKING OI DECAY SYMBOL + EXPIRY LOGIC
-# ============================================================
+# oidecay.py — Full OTM CE & PE Scanner (with close price + footer)
+
+
+
 
 import streamlit as st
 import requests
 import pandas as pd
-import numpy as np
+
 import gzip, json
 from datetime import datetime
-from io import BytesIO
+import hashlib
 import time
-import os
 
-# ============================================================
-# STREAMLIT CONFIG
-# ============================================================
-st.set_page_config(
-    page_title="Gamma Premium Scanner",
-    layout="wide",
-    page_icon="⚡"
-)
 
-st.title("⚡ Gamma Premium Expansion Scanner")
-st.caption("ITM-3 Gamma | Using proven OI-scanner expiry logic")
 
-BASE_URL = "https://api.upstox.com/v2"
 
-# ============================================================
-# ACCESS TOKEN (SAME STYLE AS WORKING CODE)
-# ============================================================
+
+
+
+
+
+
+
+def hash_pwd(pwd):
+    return hashlib.sha256(pwd.encode()).hexdigest()
+
+USERS = st.secrets["users"]
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔐 Login Required")
+
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if u in USERS and hash_pwd(p) == USERS[u]:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
+
+    st.stop()
+
+# ---------------------------- CONFIG ----------------------------
+st.set_page_config(page_title="OTM OI Decay Scanner", layout="wide",page_icon="🚦")
+
+# 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
+# =====================================================
+c1, c2, c3 = st.columns([1.2, 1.8, 6])
+
+with c1:
+    if st.button("🔄 Refresh Now"):
+        st.cache_data.clear()
+        st.rerun()
+
+with c2:
+    auto_refresh = st.toggle("⏱ Auto Refresh (3 min)", value=False)
+
+with c3:
+    st.caption("Manual refresh forces fresh NOAA weather + NG demand recalculation")
+# =====================================================
+# AUTO REFRESH TIMER (SAFE)
+# =====================================================
+if auto_refresh:
+    now = time.time()
+    last = st.session_state.get("last_refresh", 0)
+
+    if now - last > 3 * 60:  # 30 minutes
+        st.session_state["last_refresh"] = now
+        st.cache_data.clear()
+        st.rerun()
+
+# -------------------- LOAD ACCESS TOKEN --------------------
 def load_access_token(path="token.txt"):
     try:
         with open(path, "r") as f:
             token = f.read().strip()
             if not token:
-                raise ValueError("Empty token")
+                raise ValueError("Empty token file")
             return token
+    except FileNotFoundError:
+        st.error("❌ token.txt not found. Please add your Upstox access token.")
+        st.stop()
     except Exception as e:
-        st.error(f"Upstox token error: {e}")
+        st.error(f"❌ Failed to read access token: {e}")
         st.stop()
 
 ACCESS_TOKEN = load_access_token()
 
+
 HEADERS = {
     "Accept": "application/json",
-    "Authorization": f"Bearer {ACCESS_TOKEN}"
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
 }
+BASE_URL = "https://api.upstox.com/v2"
 
-# ============================================================
-# LOAD MASTER (SAME AS WORKING CODE)
-# ============================================================
+# ---------------------------- LOAD MASTER ----------------------------
+
+
 @st.cache_data
 def load_master():
     with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
         return json.load(f)
 
 master = load_master()
+symbols = sorted({x["underlying_symbol"] for x in master if x.get("underlying_symbol")})
 
-# ============================================================
-# SYMBOL → INSTRUMENT KEY (SAME AS WORKING CODE)
-# ============================================================
-sym_to_inst = {}
-for x in master:
-    sym = x.get("underlying_symbol")
-    uk = x.get("underlying_key")
-    if sym and uk and sym not in sym_to_inst:
-        sym_to_inst[sym] = uk
 
-ALL_SYMBOLS = sorted(sym_to_inst.keys())
 
-# ============================================================
-# SAFE EXPIRY FORMAT (REUSED)
-# ============================================================
+
+
+
+
+
+
+
+
+
+
+# ---------------------------- EXPIRY FORMAT SAFE ----------------------------
+
+
 def safe_expiry(raw):
+    """Convert raw expiry to YYYY-MM-DD safely."""
     try:
+        # String date
         if isinstance(raw, str):
             return pd.to_datetime(raw).strftime("%Y-%m-%d")
+
+        # Milliseconds
         if raw > 1e12:
             return datetime.utcfromtimestamp(raw / 1000).strftime("%Y-%m-%d")
+
+        # Seconds
         return datetime.utcfromtimestamp(raw).strftime("%Y-%m-%d")
     except:
         return None
 
-# ============================================================
-# GET EXPIRIES (REUSED)
-# ============================================================
-@st.cache_data(ttl=300)
-def get_expiries(inst):
-    r = requests.get(
-        f"{BASE_URL}/option/contract",
-        headers=HEADERS,
-        params={"instrument_key": inst}
-    )
+
+# ---------------------------- GET EXPIRIES ----------------------------
+def get_expiries(instrument_key):
+    url = f"{BASE_URL}/option/contract"
+    r = requests.get(url, headers=HEADERS, params={"instrument_key": instrument_key})
+
+
+
+
+
     if r.status_code != 200:
         return []
 
+    data = r.json().get("data", [])
     out = []
-    for d in r.json().get("data", []):
+    for d in data:
         e = safe_expiry(d.get("expiry"))
         if e:
             out.append(e)
-
     return sorted(set(out))
 
-# ============================================================
-# OPTION CHAIN (GAMMA ONLY)
-# ============================================================
-@st.cache_data(ttl=30)
+
+
+# ---------------------------- GET CHAIN ----------------------------
+
+
+
 def get_chain(inst, expiry):
-    r = requests.get(
-        f"{BASE_URL}/option/chain",
-        headers=HEADERS,
-        params={"instrument_key": inst, "expiry_date": expiry}
-    )
+    url = f"{BASE_URL}/option/chain"
+    r = requests.get(url, headers=HEADERS, params={"instrument_key": inst, "expiry_date": expiry})
+
+
+
     if r.status_code != 200:
         return pd.DataFrame()
 
+    data = r.json().get("data", [])
     rows = []
-    for x in r.json().get("data", []):
+    for x in data:
         ce = x.get("call_options", {})
         pe = x.get("put_options", {})
 
         rows.append({
-            "Strike": x.get("strike_price"),
-            "Spot": x.get("underlying_spot_price"),
+            "Strike": x.get("strike_price", 0),
+            "Spot": x.get("underlying_spot_price", 0),
 
-            "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
-            "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
+            # CE
+            "CE_OI": ce.get("market_data", {}).get("oi", 0),
+            "CE_prev_OI": ce.get("market_data", {}).get("prev_oi", 0),
+
+            # PE
+            "PE_OI": pe.get("market_data", {}).get("oi", 0),
+            "PE_prev_OI": pe.get("market_data", {}).get("prev_oi", 0),
         })
 
     df = pd.DataFrame(rows)
+
+    # numeric conversion
     for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    return df.dropna(subset=["Strike", "Spot"])
+    return df
 
-# ============================================================
-# UI
-# ============================================================
-st.markdown("### 🔎 Symbol & Expiry Selection")
 
-c1, c2 = st.columns(2)
 
-with c1:
-    select_all = st.checkbox("✅ Select All Symbols")
-    symbols = ALL_SYMBOLS if select_all else st.multiselect(
-        "Symbols",
-        ALL_SYMBOLS,
-        default=ALL_SYMBOLS[:1] if ALL_SYMBOLS else []
-    )
+# ---------------------------- GET INSTRUMENT KEY ----------------------------
+sym_to_inst = {}
 
-with c2:
-    expiry = None
-    if symbols:
-        expiries = get_expiries(sym_to_inst[symbols[0]])
-        if expiries:
-            expiry = st.selectbox("Expiry", expiries)
-        else:
-            st.warning("No expiries found")
+for x in master:
+    sy = x.get("underlying_symbol")
+    uk = x.get("underlying_key")
+    if sy and uk and sy not in sym_to_inst:
+        sym_to_inst[sy] = uk
 
-run_scan = st.button("🚀 Run Gamma Scan")
 
-# ============================================================
-# GAMMA SCAN LOGIC
-# ============================================================
-if run_scan and symbols and expiry:
-    results = []
+# ---------------------------- UI ----------------------------
+st.title("📉 OTM1/2/3 OI Decay Scanner")
 
-    for sym in symbols:
-        inst = sym_to_inst.get(sym)
-        if not inst:
-            continue
+decay_limit = st.number_input(
+    "Minimum OI Decay % (negative, ex: -20 means -20% drop)",
+    value=-20.0,
+    step=0.5
+)
 
-        df = get_chain(inst, expiry)
-        if df.empty:
-            continue
+st.write("Scanning all symbols…")
 
-        spot = df["Spot"].iloc[0]
-        strikes = df["Strike"].values
-        atm_idx = int(np.argmin(np.abs(strikes - spot)))
+# ---------------------------- PROCESS ALL ----------------------------
 
-        ce_itm = df.iloc[max(atm_idx - 3, 0):atm_idx]["CE_Gamma"].dropna()
-        pe_itm = df.iloc[atm_idx + 1:atm_idx + 4]["PE_Gamma"].dropna()
+out_rows = []
 
-        if len(ce_itm) == 3:
-            ce_score = ce_itm.mean()
-            ce_thr = np.nanpercentile(df["CE_Gamma"].dropna(), 75)
-            if ce_score > ce_thr:
-                results.append({
-                    "Symbol": sym,
-                    "Side": "CALL",
-                    "ATM": int(strikes[atm_idx]),
-                    "GammaScore": round(ce_score, 6),
-                    "Bias": "Upside Premium Expansion"
-                })
+for sym in symbols:
+    inst = sym_to_inst.get(sym)
+    if not inst:
+        continue
 
-        if len(pe_itm) == 3:
-            pe_score = pe_itm.mean()
-            pe_thr = np.nanpercentile(df["PE_Gamma"].dropna(), 75)
-            if pe_score > pe_thr:
-                results.append({
-                    "Symbol": sym,
-                    "Side": "PUT",
-                    "ATM": int(strikes[atm_idx]),
-                    "GammaScore": round(pe_score, 6),
-                    "Bias": "Downside Premium Expansion"
-                })
+    expiries = get_expiries(inst)
+    if not expiries:
+        continue
 
-        time.sleep(0.15)
+    expiry = expiries[0]     # nearest expiry
 
-    # ========================================================
-    # OUTPUT
-    # ========================================================
-    if results:
-        out = pd.DataFrame(results).sort_values("GammaScore", ascending=False)
-        st.success(f"🔥 Gamma Opportunities Found: {len(out)}")
-        st.dataframe(out, use_container_width=True)
+    df = get_chain(inst, expiry)
+    if df.empty:
+        continue
 
-        buf = BytesIO()
-        out.to_excel(buf, index=False)
-        buf.seek(0)
+    spot = float(df["Spot"].iloc[0])
 
-        st.download_button(
-            "📥 Download Gamma Scan Excel",
-            buf,
-            "gamma_premium_scan.xlsx"
-        )
-    else:
-        st.warning("No gamma expansion setups found.")
+    # OTM CE = Strike > spot
+    ce_otm = df[df["Strike"] > spot].sort_values("Strike").head(3)
+
+    # OTM PE = Strike < spot
+    pe_otm = df[df["Strike"] < spot].sort_values("Strike", ascending=False).head(3)
+
+    # compute decay (negative means reduction)
+    ce_otm["CE_decay"] = ((ce_otm["CE_OI"] - ce_otm["CE_prev_OI"]) / ce_otm["CE_prev_OI"].replace(0, 1)) * 100
+    pe_otm["PE_decay"] = ((pe_otm["PE_OI"] - pe_otm["PE_prev_OI"]) / pe_otm["PE_prev_OI"].replace(0, 1)) * 100
+
+    # need at least 2 consecutive CE OTM strikes decayed more than decay_limit
+    cond_ce = (len(ce_otm) >= 2 and
+               (ce_otm["CE_decay"].iloc[0] <= decay_limit and ce_otm["CE_decay"].iloc[1] <= decay_limit))
+
+    cond_pe = (len(pe_otm) >= 2 and
+               (pe_otm["PE_decay"].iloc[0] <= decay_limit and pe_otm["PE_decay"].iloc[1] <= decay_limit))
+
+    if cond_ce or cond_pe:
+        out_rows.append({
+            "Symbol": sym,
+            "Close": round(spot, 2),
+            "CE_OTM1": int(ce_otm["Strike"].iloc[0]) if len(ce_otm) >= 1 else "",
+            "CE_Dec1%": round(ce_otm["CE_decay"].iloc[0], 2) if len(ce_otm) >= 1 else "",
+            "CE_OTM2": int(ce_otm["Strike"].iloc[1]) if len(ce_otm) >= 2 else "",
+            "CE_Dec2%": round(ce_otm["CE_decay"].iloc[1], 2) if len(ce_otm) >= 2 else "",
+            "CE_OTM3": int(ce_otm["Strike"].iloc[2]) if len(ce_otm) >= 3 else "",
+            "CE_Dec3%": round(ce_otm["CE_decay"].iloc[2], 2) if len(ce_otm) >= 3 else "",
+
+            "PE_OTM1": int(pe_otm["Strike"].iloc[0]) if len(pe_otm) >= 1 else "",
+            "PE_Dec1%": round(pe_otm["PE_decay"].iloc[0], 2) if len(pe_otm) >= 1 else "",
+            "PE_OTM2": int(pe_otm["Strike"].iloc[1]) if len(pe_otm) >= 2 else "",
+            "PE_Dec2%": round(pe_otm["PE_decay"].iloc[1], 2) if len(pe_otm) >= 2 else "",
+            "PE_OTM3": int(pe_otm["Strike"].iloc[2]) if len(pe_otm) >= 3 else "",
+            "PE_Dec3%": round(pe_otm["PE_decay"].iloc[2], 2) if len(pe_otm) >= 3 else "",
+        })
+
+# ---------------------------- OUTPUT ----------------------------
+if out_rows:
+    st.success("✔ Scanning Completed — Matching Stocks Found")
+    st.dataframe(pd.DataFrame(out_rows), use_container_width=True)
+else:
+    st.warning("✔ Scanning Completed — No stocks matched the decay condition")
+
+
+# ---------------------------- FOOTER ----------------------------
+st.markdown("---")
+st.markdown(
+    """
+    <div style="display:flex;justify-content:center;padding:10px 0;">
+      <span style="font-weight:700;color:#0ea5a4;font-size:14px;font-family:'Segoe UI',Roboto,Arial;">
+        Designed By <span style="color:#ffd86b">Gaurav Singh Yadav</span>
+      </span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+
+
+
+
+
+
+
+st.markdown("""
+---
+**Designed by:-  
+Gaurav Singh Yadav**   
+🩷💛🩵💙🩶💜🤍🤎💖  Built With Love 🫶  
+Energy | Commodity | Quant Intelligence 📶  
+📱 +91-8003994518 〽️   
+📧 yadav.gauravsingh@gmail.com ™️
+""")
