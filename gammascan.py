@@ -15,7 +15,7 @@ from io import BytesIO
 import os
 
 # ============================================================
-# STREAMLIT CONFIG
+# STREAMLIT CONFIG (MUST BE FIRST)
 # ============================================================
 st.set_page_config(
     page_title="Gamma Premium Scanner",
@@ -26,28 +26,30 @@ st.set_page_config(
 st.title("⚡ Gamma-Based Premium Expansion Scanner")
 st.caption("Pure Gamma | ITM-3 | High Convexity Option Trades")
 
-# ============================================================
-# UPSTOX CONFIG
-# ============================================================
 UP_BASE = "https://api.upstox.com/v2"
 
+# ============================================================
+# SAFE ACCESS TOKEN LOAD (SESSION-SAFE)
+# ============================================================
 def load_access_token():
     if "UPSTOX_TOKEN" in st.secrets:
         return st.secrets["UPSTOX_TOKEN"]
 
-    token_path = "token.txt"
-    if not os.path.exists(token_path):
-        st.error("❌ UPSTOX_TOKEN not found (Secrets / token.txt)")
+    if os.path.exists("token.txt"):
+        token = open("token.txt").read().strip()
+        if token:
+            return token
+
+    raise RuntimeError("Upstox access token not found")
+
+if "ACCESS_TOKEN" not in st.session_state:
+    try:
+        st.session_state.ACCESS_TOKEN = load_access_token()
+    except Exception as e:
+        st.error(str(e))
         st.stop()
 
-    token = open(token_path).read().strip()
-    if not token:
-        st.error("❌ Access token empty")
-        st.stop()
-
-    return token
-
-ACCESS_TOKEN = load_access_token()
+ACCESS_TOKEN = st.session_state.ACCESS_TOKEN
 
 UP_HEADERS = {
     "Accept": "application/json",
@@ -60,15 +62,23 @@ UP_HEADERS = {
 @st.cache_data(show_spinner=False)
 def load_master(path="complete.json.gz"):
     if not os.path.exists(path):
-        st.error("❌ complete.json.gz not found in repo root")
-        st.stop()
+        raise FileNotFoundError("complete.json.gz not found in repo root")
 
     with gzip.open(path, "rt", encoding="utf-8") as f:
         return json.load(f)
 
-master_data = load_master()
+try:
+    master_data = load_master()
+except Exception as e:
+    st.error(f"Master file error: {e}")
+    st.stop()
 
-symbol_map = {}
+# ============================================================
+# BUILD EQ & FO MAPS (CRITICAL FIX)
+# ============================================================
+eq_map = {}
+fo_map = {}
+
 for item in master_data:
     sym = item.get("underlying_symbol")
     uk = (
@@ -76,17 +86,23 @@ for item in master_data:
         or item.get("underlyingInstrumentKey")
         or item.get("underlyingInstrument_key")
     )
-    if sym and uk:
-        symbol_map[sym] = uk
 
-ALL_SYMBOLS = sorted(symbol_map.keys())
+    if not sym or not uk:
+        continue
+
+    if uk.startswith("NSE_EQ"):
+        eq_map[sym] = uk
+    elif uk.startswith("NSE_FO"):
+        fo_map[sym] = uk
+
+ALL_SYMBOLS = sorted(fo_map.keys())  # ONLY OPTIONABLE SYMBOLS
 
 # ============================================================
-# SPOT PRICE (UPSTOX)
+# SPOT PRICE (EQ ONLY)
 # ============================================================
 @st.cache_data(ttl=20)
 def get_spot_price(symbol: str) -> Optional[float]:
-    ik = symbol_map.get(symbol)
+    ik = eq_map.get(symbol)
     if not ik:
         return None
 
@@ -103,11 +119,11 @@ def get_spot_price(symbol: str) -> Optional[float]:
     return r.json().get("data", {}).get(ik, {}).get("last_price")
 
 # ============================================================
-# EXPIRY LIST
+# EXPIRY LIST (FO ONLY)
 # ============================================================
 @st.cache_data(ttl=300)
 def get_expiry_list(symbol: str):
-    ik = symbol_map.get(symbol)
+    ik = fo_map.get(symbol)
     if not ik:
         return []
 
@@ -130,15 +146,19 @@ def get_expiry_list(symbol: str):
     return sorted(expiries)
 
 # ============================================================
-# OPTION CHAIN (GAMMA ONLY)
+# OPTION CHAIN (FO ONLY – GAMMA)
 # ============================================================
 @st.cache_data(ttl=30)
-def get_option_chain(symbol, expiry):
+def get_option_chain(symbol: str, expiry: str):
+    ik = fo_map.get(symbol)
+    if not ik:
+        return None
+
     r = requests.get(
         f"{UP_BASE}/option/chain",
         headers=UP_HEADERS,
         params={
-            "instrument_key": symbol_map[symbol],
+            "instrument_key": ik,
             "expiry_date": expiry
         },
         timeout=10
@@ -167,7 +187,7 @@ def get_option_chain(symbol, expiry):
 # ============================================================
 # ITM-3 GAMMA LOGIC
 # ============================================================
-def extract_itm3_gamma(df, spot):
+def extract_itm3_gamma(df: pd.DataFrame, spot: float):
     strikes = df["Strike"].values
     atm_idx = int(np.argmin(np.abs(strikes - spot)))
 
@@ -185,24 +205,18 @@ c1, c2 = st.columns(2)
 
 with c1:
     select_all = st.checkbox("✅ Select All Symbols")
-
-    if select_all:
-        symbols = ALL_SYMBOLS
-    else:
-        symbols = st.multiselect("Symbols", ALL_SYMBOLS, default=["NIFTY"])
+    symbols = ALL_SYMBOLS if select_all else st.multiselect(
+        "Symbols", ALL_SYMBOLS, default=["NIFTY"]
+    )
 
 with c2:
     expiry = None
     if symbols:
-        expiry_list = get_expiry_list(symbols[0])
-
-        if not expiry_list:
-            st.warning(
-                f"No option expiries found for {symbols[0]} "
-                "(symbol may not be optionable)"
-            )
+        exp_list = get_expiry_list(symbols[0])
+        if exp_list:
+            expiry = st.selectbox("Expiry", exp_list)
         else:
-            expiry = st.selectbox("Expiry", expiry_list)
+            st.warning(f"No option expiries found for {symbols[0]}")
 
 run_gamma = st.button("🚀 Gamma Scan")
 
@@ -264,4 +278,4 @@ if run_gamma and symbols and expiry:
             "gamma_premium_scan.xlsx"
         )
     else:
-        st.warning("No symbols found in tradable Gamma zone.")
+        st.warning("No tradable gamma opportunities found.")
