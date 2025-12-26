@@ -1,5 +1,5 @@
 # ============================================================
-# FUTURES MARKET DEPTH SCANNER (NO GAMMA)
+# FUTURES ORDERBOOK PRESSURE SCANNER (USING TOTAL BID/ASK QTY)
 # ============================================================
 
 import streamlit as st
@@ -7,25 +7,23 @@ import requests, gzip, json, time, os
 import pandas as pd
 
 st.set_page_config(
-    page_title="Futures Market Depth Scanner",
+    page_title="Futures Orderbook Pressure Scanner",
     page_icon="📊",
     layout="wide"
 )
 
-st.title("📊 Futures Market Depth Scanner")
-st.caption("Scans all futures using market depth (total bid / ask) – no gamma.")
+st.title("📊 Futures Orderbook Pressure Scanner")
+st.caption("Scans futures using total bid / ask quantities from full market quote (no gamma).")
 
 BASE_URL = "https://api.upstox.com/v2"
 
 # ============================================================
-# SESSION STATE: AUTO REFRESH & PREVIOUS TOP 20
+# SESSION STATE
 # ============================================================
 if "auto_refresh" not in st.session_state:
     st.session_state["auto_refresh"] = False
-
 if "last_run" not in st.session_state:
     st.session_state["last_run"] = 0.0
-
 if "prev_top20_md" not in st.session_state:
     st.session_state["prev_top20_md"] = pd.DataFrame()
 
@@ -50,13 +48,13 @@ HEADERS = {
 }
 
 # ============================================================
-# LOAD FUTURE UNDERLYINGS → FUTURE INSTRUMENT KEYS
+# FUTURES MAP FROM complete.json.gz
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_fut_map():
     """
     Symbol → FUT instrument_key (NSE_FO futures).
-    Upstox JSON: segment='NSE_FO', instrument_type='FUT' for futures.[web:4][web:18]
+    Upstox JSON: segment='NSE_FO', instrument_type='FUT' for futures.[web:4]
     """
     if not os.path.isfile("complete.json.gz"):
         st.error("❌ complete.json.gz not found")
@@ -83,9 +81,8 @@ def load_fut_map():
         sym = item.get("underlying_symbol") or item.get("trading_symbol")
         ikey = item.get("instrument_key")
 
-        if sym and ikey:
-            if sym not in fut_map:
-                fut_map[sym] = ikey
+        if sym and ikey and sym not in fut_map:
+            fut_map[sym] = ikey
 
     return dict(sorted(fut_map.items()))
 
@@ -93,18 +90,18 @@ FUT_MAP = load_fut_map()
 FUT_SYMBOLS = list(FUT_MAP.keys())
 
 st.caption(f"🧪 System Check — Futures loaded: {len(FUT_SYMBOLS)}")
-
 if not FUT_SYMBOLS:
     st.error("❌ No futures instruments loaded from complete.json.gz")
     st.stop()
 
 # ============================================================
-# MARKET DEPTH API
+# FULL MARKET QUOTE: USING TOTAL BUY / SELL QUANTITIES
 # ============================================================
 @st.cache_data(ttl=5)
-def get_market_depth(instrument_keys):
+def get_full_quotes(instrument_keys):
     """
-    Full Market Quotes for up to 500 keys.[web:92][web:124]
+    Full Market Quotes; use total_buy_quantity / total_sell_quantity instead of depth arrays,
+    which are often empty for FnO.[web:92][web:134]
     """
     if not instrument_keys:
         return {}
@@ -126,31 +123,19 @@ def get_market_depth(instrument_keys):
     except Exception:
         return {}
 
-    # data is dict keyed by EXACT instrument_key string passed.[web:92][web:124]
     return j.get("data", {})
 
-def parse_depth(sym, ikey, record):
-    depth = record.get("depth", {}) or {}
-    buy_levels = depth.get("buy", []) or []
-    sell_levels = depth.get("sell", []) or []
-
-    ltp = record.get("last_price") or record.get("ltp") or 0.0
-
-    total_buy = sum(lvl.get("quantity", 0) for lvl in buy_levels)
-    total_sell = sum(lvl.get("quantity", 0) for lvl in sell_levels)
-
-    # Fallback to total_buy_quantity / total_sell_quantity if depth arrays are empty.[web:92]
-    if total_buy == 0:
-        total_buy = record.get("total_buy_quantity", 0)
-    if total_sell == 0:
-        total_sell = record.get("total_sell_quantity", 0)
+def parse_record(sym, ikey, record):
+    last_price = record.get("last_price") or record.get("ltp") or 0.0
+    total_bid = record.get("total_buy_quantity", 0)
+    total_ask = record.get("total_sell_quantity", 0)
 
     return {
         "Symbol": sym,
         "InstrumentKey": ikey,
-        "Fut_Price": float(ltp) if ltp is not None else 0.0,
-        "Total_Bid_Qty": total_buy,
-        "Total_Ask_Qty": total_sell,
+        "Fut_Price": float(last_price) if last_price is not None else 0.0,
+        "Total_Bid_Qty": int(total_bid) if total_bid is not None else 0,
+        "Total_Ask_Qty": int(total_ask) if total_ask is not None else 0,
     }
 
 # ============================================================
@@ -174,10 +159,10 @@ if st.button("⟳ Toggle Auto-Refresh (2 min)"):
 
 st.caption(
     f"Auto-refresh is **{'ON' if st.session_state['auto_refresh'] else 'OFF'}** "
-    f"(interval: 2 minutes). Depth uses full quote with top-5 levels or total quantities.[web:92][web:96]"
+    f"(interval: 2 minutes). Uses total buy/sell quantities from full quotes for FnO.[web:92][web:135]"
 )
 
-scan_button = st.button("🚀 Scan Futures Market Depth")
+scan_button = st.button("🚀 Scan Futures Orderbook Pressure")
 
 # ============================================================
 # AUTO REFRESH (2 MIN)
@@ -202,24 +187,21 @@ if do_run:
     progress = st.progress(0.0)
     status = st.empty()
 
-    data = get_market_depth(ikeys)
+    data = get_full_quotes(ikeys)
 
     rows = []
     for i, sym in enumerate(scan_list, start=1):
         ikey = FUT_MAP[sym]
-
-        # IMPORTANT: keys are exactly the same instrument_key strings you passed.[web:92][web:124]
         rec = data.get(ikey, {})
 
         if rec:
-            parsed = parse_depth(sym, ikey, rec)
-            rows.append(parsed)
+            rows.append(parse_record(sym, ikey, rec))
 
         progress.progress(i / len(scan_list))
-        status.text(f"Processed depth for {sym}")
+        status.text(f"Processed quote for {sym}")
 
     if not rows:
-        st.error("No depth data received for selected futures.")
+        st.error("No quote data received for selected futures.")
     else:
         df = pd.DataFrame(rows)
 
@@ -236,6 +218,7 @@ if do_run:
                 ascending=[False, False]
             ).head(20)
 
+            # ALERT: new futures in top 20
             prev = st.session_state["prev_top20_md"]
             new_rows = df_sorted.copy()
 
@@ -250,18 +233,18 @@ if do_run:
                         for _, row in new_rows.iterrows()
                     ]
                     added_df = new_rows[added_mask]
-                    st.error("🔔 New futures entered TOP 20 (depth filter)!")
+                    st.error("🔔 New futures entered TOP 20 (bid/ask filter)!")
                     st.table(
                         added_df[["Symbol", "Fut_Price", "Total_Bid_Qty", "Total_Ask_Qty"]]
                     )
 
             st.session_state["prev_top20_md"] = df_sorted.copy()
 
-            st.success("Top 20 Futures by Market Depth (Bid/Ask filters applied)")
+            st.success("Top 20 Futures by Total Bid/Ask Quantity")
             st.dataframe(df_sorted, use_container_width=True)
 
 # ============================================================
 # FOOTER
 # ============================================================
 st.markdown("---")
-st.markdown("**Designed by: Gaurav Singh Yadav**  \nFutures | Market Depth | Institutional Flow")
+st.markdown("**Designed by: Gaurav Singh Yadav**  \nFutures | Orderbook | Institutional Flow")
