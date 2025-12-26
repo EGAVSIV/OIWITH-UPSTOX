@@ -1,52 +1,27 @@
 # ============================================================
-# GAMMA PREMIUM EXPANSION SCANNER – PRO (STABLE)
-# GAMMA × OI × IV | SKEW | SCALPING MODE
+# GAMMA BUYER DOMINANCE SCANNER (MULTI-SYMBOL SAFE)
+# CALL BUY vs PUT BUY | ATM DECISION ENGINE
 # ============================================================
 
 import streamlit as st
-import requests
+import requests, gzip, json, time, math
 import pandas as pd
 import numpy as np
-import gzip, json, time, math
 from io import BytesIO
 
-# ============================================================
-# STREAMLIT CONFIG (FIRST LINE ALWAYS)
-# ============================================================
+# ================= STREAMLIT CONFIG =================
 st.set_page_config(
-    page_title="Gamma Premium Scanner Pro",
+    page_title="Gamma Buyer Dominance Scanner",
     page_icon="⚡",
     layout="wide"
 )
 
-st.title("⚡ Gamma Premium Expansion Scanner – PRO")
-st.caption("Gamma × OI × IV | Skew | Scalping Mode | Intraday")
+st.title("⚡ Gamma Buyer Dominance Scanner")
+st.caption("ATM Call Buy vs Put Buy | Buyer-Driven Direction")
 
 BASE_URL = "https://api.upstox.com/v2"
 
-# ============================================================
-# AUTO REFRESH (SAFE)
-# ============================================================
-c1, c2, _ = st.columns([1.3, 1.6, 6])
-
-with c1:
-    if st.button("🔄 Refresh Now"):
-        st.session_state.last_refresh = time.time()
-        st.rerun()
-
-with c2:
-    auto_refresh = st.toggle("⏱ Auto Refresh (5 min)", value=False)
-
-if auto_refresh:
-    now = time.time()
-    last = st.session_state.get("last_refresh", 0)
-    if now - last > 5 * 60:
-        st.session_state.last_refresh = now
-        st.rerun()
-
-# ============================================================
-# ACCESS TOKEN
-# ============================================================
+# ================= ACCESS TOKEN =================
 def load_token():
     if "UPSTOX_TOKEN" in st.secrets:
         return st.secrets["UPSTOX_TOKEN"]
@@ -58,9 +33,7 @@ HEADERS = {
     "Authorization": f"Bearer {load_token()}",
 }
 
-# ============================================================
-# LOAD MASTER
-# ============================================================
+# ================= LOAD MASTER =================
 @st.cache_data
 def load_master():
     with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
@@ -68,18 +41,16 @@ def load_master():
 
 master = load_master()
 
-sym_to_inst = {
+SYMBOL_MAP = {
     x["underlying_symbol"]: x["underlying_key"]
     for x in master
     if x.get("underlying_symbol")
     and x.get("underlying_key", "").startswith("NSE_FO")
 }
 
-ALL_SYMBOLS = sorted(sym_to_inst.keys())
+ALL_SYMBOLS = sorted(SYMBOL_MAP.keys())
 
-# ============================================================
-# SAFE EXPIRY
-# ============================================================
+# ================= SAFE EXPIRY =================
 def safe_expiry(v):
     try:
         if isinstance(v, str):
@@ -100,16 +71,13 @@ def get_expiries(inst):
     )
     if r.status_code != 200:
         return []
-
     return sorted({
         safe_expiry(x.get("expiry"))
         for x in r.json().get("data", [])
         if safe_expiry(x.get("expiry"))
     })
 
-# ============================================================
-# OPTION CHAIN (NO SPOT DEPENDENCY)
-# ============================================================
+# ================= OPTION CHAIN =================
 def get_chain(inst, expiry):
     r = requests.get(
         f"{BASE_URL}/option/chain",
@@ -127,14 +95,13 @@ def get_chain(inst, expiry):
 
         rows.append({
             "Strike": x.get("strike_price"),
-
-            "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
-            "CE_IV": ce.get("option_greeks", {}).get("iv"),
+            "CE_LTP": ce.get("market_data", {}).get("ltp"),
             "CE_OI": ce.get("market_data", {}).get("oi"),
+            "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
 
-            "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
-            "PE_IV": pe.get("option_greeks", {}).get("iv"),
+            "PE_LTP": pe.get("market_data", {}).get("ltp"),
             "PE_OI": pe.get("market_data", {}).get("oi"),
+            "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
         })
 
     df = pd.DataFrame(rows)
@@ -143,109 +110,73 @@ def get_chain(inst, expiry):
 
     return df.dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
 
-# ============================================================
-# COMPOSITE SCORE
-# ============================================================
-def composite_score(g, oi, iv):
-    if g <= 0 or oi <= 0 or iv <= 0:
-        return None
-    return g * math.log1p(oi) * iv
+# ================= BUYER DECISION ENGINE =================
+def buyer_bias(df):
+    strikes = df["Strike"].values
+    atm_idx = len(strikes) // 2
 
-# ============================================================
-# UI
-# ============================================================
-st.markdown("### 🔎 Symbol & Expiry")
+    atm = df.iloc[atm_idx]
 
-c1, c2, c3 = st.columns([2.5, 2, 2])
+    ce_strength = atm["CE_LTP"] * atm["CE_Gamma"] * atm["CE_OI"]
+    pe_strength = atm["PE_LTP"] * atm["PE_Gamma"] * atm["PE_OI"]
 
-with c1:
-    select_all = st.checkbox("✅ Select All Symbols")
-    symbols = ALL_SYMBOLS if select_all else st.multiselect(
-        "Symbols", ALL_SYMBOLS, default=ALL_SYMBOLS[:1]
-    )
+    if ce_strength > pe_strength * 1.15:
+        return "CALL BUY", int(atm["Strike"]), round(ce_strength, 2)
+    elif pe_strength > ce_strength * 1.15:
+        return "PUT BUY", int(atm["Strike"]), round(pe_strength, 2)
+    else:
+        return None, None, None
 
-with c2:
-    expiry = None
-    if symbols:
-        exps = get_expiries(sym_to_inst[symbols[0]])
-        expiry = st.selectbox("Expiry", exps) if exps else None
+# ================= UI =================
+st.markdown("### 🔎 Symbol Selection")
 
-with c3:
-    scalping_mode = st.checkbox("⚡ Intraday Scalping (ATM ±1)", value=False)
+select_all = st.checkbox("✅ Select All Symbols")
+symbols = ALL_SYMBOLS if select_all else st.multiselect(
+    "Symbols", ALL_SYMBOLS, default=ALL_SYMBOLS[:1]
+)
 
-run_scan = st.button("🚀 Run Gamma Scan")
+expiry = None
+if symbols:
+    exps = get_expiries(SYMBOL_MAP[symbols[0]])
+    expiry = st.selectbox("Expiry", exps) if exps else None
 
-# ============================================================
-# MAIN SCAN
-# ============================================================
-if run_scan and symbols and expiry:
+run = st.button("🚀 Scan Buyer Dominance")
+
+# ================= MAIN SCAN (SAFE) =================
+if run and symbols and expiry:
+
     results = []
 
-    with st.spinner("Scanning gamma convexity…"):
+    with st.spinner("Scanning buyer dominance…"):
         for sym in symbols:
-            df = get_chain(sym_to_inst[sym], expiry)
-            if df.empty or len(df) < 6:
+            df = get_chain(SYMBOL_MAP[sym], expiry)
+            if df.empty or len(df) < 5:
                 continue
 
-            strikes = df["Strike"].values
-            atm_idx = len(strikes) // 2  # SAFE ATM APPROX
+            side, strike, strength = buyer_bias(df)
+            if not side:
+                continue
 
-            if scalping_mode:
-                ce_slice = df.iloc[atm_idx-1:atm_idx+1]
-                pe_slice = df.iloc[atm_idx:atm_idx+2]
-            else:
-                ce_slice = df.iloc[atm_idx-3:atm_idx]
-                pe_slice = df.iloc[atm_idx+1:atm_idx+4]
-
-            ce_g = ce_slice["CE_Gamma"].mean()
-            pe_g = pe_slice["PE_Gamma"].mean()
-
-            ce_score = composite_score(
-                ce_g,
-                ce_slice["CE_OI"].sum(),
-                ce_slice["CE_IV"].mean()
-            )
-            pe_score = composite_score(
-                pe_g,
-                pe_slice["PE_OI"].sum(),
-                pe_slice["PE_IV"].mean()
-            )
-
-            skew = "CALL_DOMINANT" if ce_score and pe_score and ce_score > pe_score else "PUT_DOMINANT"
-
-            if ce_score:
-                results.append({
-                    "Symbol": sym,
-                    "Side": "CALL",
-                    "ATM": int(strikes[atm_idx]),
-                    "CompositeScore": round(ce_score, 4),
-                    "GammaSkew": skew
-                })
-
-            if pe_score:
-                results.append({
-                    "Symbol": sym,
-                    "Side": "PUT",
-                    "ATM": int(strikes[atm_idx]),
-                    "CompositeScore": round(pe_score, 4),
-                    "GammaSkew": skew
-                })
-
-            time.sleep(0.12)
+            results.append({
+                "Symbol": sym,
+                "Bias": side,
+                "ATM Strike": strike,
+                "Buyer Strength": strength
+            })
 
     if results:
         out = (
             pd.DataFrame(results)
-            .sort_values("CompositeScore", ascending=False)
-            .head(10)
+            .sort_values("Buyer Strength", ascending=False)
         )
 
-        st.success("🏆 Top-10 Tradable Gamma Opportunities")
+        st.success("🏆 Clear Option Buyer Dominance Found")
         st.dataframe(out, width="stretch")
 
         buf = BytesIO()
         out.to_excel(buf, index=False)
         buf.seek(0)
-        st.download_button("📥 Download Excel", buf, "gamma_top10.xlsx")
+        st.download_button("📥 Download Excel", buf, "buyer_dominance.xlsx")
+
     else:
-        st.warning("No high-quality gamma setups found.")
+        st.warning("No clear CALL / PUT buyer dominance found.")
