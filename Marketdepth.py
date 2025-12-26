@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 st.title("📊 Futures Market Depth Scanner")
-st.caption("Scans all futures underlyings using market depth (total bid / ask) – no gamma.")
+st.caption("Scans all futures using market depth (total bid / ask) – no gamma.")
 
 BASE_URL = "https://api.upstox.com/v2"
 
@@ -58,7 +58,7 @@ HEADERS = {
 def load_fut_map():
     """
     Build a map: Symbol → FUT instrument_key (NSE_FO futures).
-    Adjust logic as per complete.json.gz structure.[web:4]
+    Upstox instruments JSON: segment = 'NSE_FO', instrument_type = 'FUT' for futures.[web:4][web:18]
     """
     if not os.path.isfile("complete.json.gz"):
         st.error("❌ complete.json.gz not found")
@@ -71,19 +71,26 @@ def load_fut_map():
         st.error(f"❌ Error reading complete.json.gz: {e}")
         st.stop()
 
+    if not isinstance(master, list) or len(master) == 0:
+        st.error("❌ complete.json.gz has no records or invalid structure")
+        st.stop()
+
     fut_map = {}
     for item in master:
+        # 1) Futures segment
         if item.get("segment") != "NSE_FO":
             continue
 
-        # Typically futures have 'FUT' in instrument_type/option_type; adapt to your file
-        if item.get("instrument_type") not in ("FUTIDX", "FUTSTK"):
+        # 2) Futures instrument_type in Upstox JSON is 'FUT'[web:4]
+        if item.get("instrument_type") != "FUT":
             continue
 
-        sym = item.get("trading_symbol") or item.get("symbol") or item.get("underlying_symbol")
+        # 3) Pick a symbol – prefer underlying_symbol, else trading_symbol
+        sym = item.get("underlying_symbol") or item.get("trading_symbol")
         ikey = item.get("instrument_key")
+
         if sym and ikey:
-            # Keep first key per symbol (nearest expiry)
+            # Keep first (likely nearest expiry) per symbol
             if sym not in fut_map:
                 fut_map[sym] = ikey
 
@@ -110,7 +117,6 @@ def get_market_depth(instrument_keys):
     if not instrument_keys:
         return {}
 
-    # Upstox quotes API: /market-quote/quotes?instrument_key=KEY1,KEY2,...
     keys_param = ",".join(instrument_keys)
     url = f"{BASE_URL}/market-quote/quotes"
     r = requests.get(
@@ -128,7 +134,6 @@ def get_market_depth(instrument_keys):
     except Exception:
         return {}
 
-    # Response: {"status":"success","data":{"NSE_FO:...":{...depth...}}}[web:92]
     return j.get("data", {})
 
 def parse_depth(sym, ikey, record):
@@ -173,7 +178,7 @@ if st.button("⟳ Toggle Auto-Refresh (2 min)"):
 
 st.caption(
     f"Auto-refresh is **{'ON' if st.session_state['auto_refresh'] else 'OFF'}** "
-    f"(interval: 2 minutes). Depth uses full quote with top-5 levels.[web:92]"
+    f"(interval: 2 minutes). Depth uses full quote with top-5 levels.[web:92][web:96]"
 )
 
 scan_button = st.button("🚀 Scan Futures Market Depth")
@@ -201,18 +206,19 @@ if do_run:
     progress = st.progress(0.0)
     status = st.empty()
 
-    # Fetch depth snapshot for all selected futures
     data = get_market_depth(ikeys)
 
     rows = []
     for i, sym in enumerate(scan_list, start=1):
         ikey = FUT_MAP[sym]
+
+        # Upstox keys in quote data may be "NSE_FO:XXX" or "NSE_FO|XXX"; check both.[web:92]
         rec = data.get(ikey.replace("|", ":"), {}) or data.get(ikey, {})
-        # Upstox may key as NSE_FO:XXXX vs NSE_FO|XXXX, adjust mapping if needed.[web:92]
 
         if rec:
             parsed = parse_depth(sym, ikey, rec)
             rows.append(parsed)
+
         progress.progress(i / len(scan_list))
         status.text(f"Processed depth for {sym}")
 
@@ -221,7 +227,7 @@ if do_run:
     else:
         df = pd.DataFrame(rows)
 
-        # Apply Total Bid > filter AND Total Ask > filter
+        # Your filter: Total Bid > 60 AND Total Ask > 60 (can change thresholds in UI)
         df_filt = df[
             (df["Total_Bid_Qty"] > bid_filter) &
             (df["Total_Ask_Qty"] > ask_filter)
@@ -230,15 +236,13 @@ if do_run:
         if df_filt.empty:
             st.warning("No instruments meet the bid/ask filters.")
         else:
-            # Rank by futures price or by total depth; here sort by Total_Bid_Qty descending
+            # Rank by depth; here by Total_Bid_Qty and then Total_Ask_Qty
             df_sorted = df_filt.sort_values(
                 ["Total_Bid_Qty", "Total_Ask_Qty"],
                 ascending=[False, False]
             ).head(20)
 
-            # ============================
-            # ALERT: NEW FUTURES IN TOP 20
-            # ============================
+            # ALERT: new futures appeared in top 20
             prev = st.session_state["prev_top20_md"]
             new_rows = df_sorted.copy()
 
