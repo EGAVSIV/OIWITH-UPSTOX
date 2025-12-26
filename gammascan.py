@@ -1,19 +1,17 @@
 # ============================================================
-# GAMMA PREMIUM EXPANSION SCANNER (ADVANCED)
-# MULTI-SYMBOL | GAMMA × OI × IV | UPSTOX
+# GAMMA PREMIUM EXPANSION SCANNER – PRO (STABLE)
+# GAMMA × OI × IV | SKEW | SCALPING MODE
 # ============================================================
 
 import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
-import gzip, json, time
-from datetime import datetime
+import gzip, json, time, math
 from io import BytesIO
-import math
 
 # ============================================================
-# STREAMLIT CONFIG (MUST BE FIRST)
+# STREAMLIT CONFIG (FIRST LINE ALWAYS)
 # ============================================================
 st.set_page_config(
     page_title="Gamma Premium Scanner Pro",
@@ -22,14 +20,14 @@ st.set_page_config(
 )
 
 st.title("⚡ Gamma Premium Expansion Scanner – PRO")
-st.caption("Gamma × OI × IV | Top-10 Convex Trades | Intraday Ready")
+st.caption("Gamma × OI × IV | Skew | Scalping Mode | Intraday")
 
 BASE_URL = "https://api.upstox.com/v2"
 
 # ============================================================
-# AUTO REFRESH (INTRADAY SAFE)
+# AUTO REFRESH (SAFE)
 # ============================================================
-c1, c2, _ = st.columns([1.2, 1.5, 6])
+c1, c2, _ = st.columns([1.3, 1.6, 6])
 
 with c1:
     if st.button("🔄 Refresh Now"):
@@ -47,24 +45,21 @@ if auto_refresh:
         st.rerun()
 
 # ============================================================
-# LOAD ACCESS TOKEN
+# ACCESS TOKEN
 # ============================================================
-def load_access_token():
+def load_token():
     if "UPSTOX_TOKEN" in st.secrets:
         return st.secrets["UPSTOX_TOKEN"]
     with open("token.txt") as f:
         return f.read().strip()
 
-if "access_token" not in st.session_state:
-    st.session_state.access_token = load_access_token()
-
 HEADERS = {
     "Accept": "application/json",
-    "Authorization": f"Bearer {st.session_state.access_token}",
+    "Authorization": f"Bearer {load_token()}",
 }
 
 # ============================================================
-# LOAD MASTER FILE
+# LOAD MASTER
 # ============================================================
 @st.cache_data
 def load_master():
@@ -73,7 +68,6 @@ def load_master():
 
 master = load_master()
 
-# FO SYMBOLS ONLY (CRITICAL)
 sym_to_inst = {
     x["underlying_symbol"]: x["underlying_key"]
     for x in master
@@ -84,15 +78,15 @@ sym_to_inst = {
 ALL_SYMBOLS = sorted(sym_to_inst.keys())
 
 # ============================================================
-# SAFE EXPIRY FORMAT
+# SAFE EXPIRY
 # ============================================================
-def safe_expiry(raw):
+def safe_expiry(v):
     try:
-        if isinstance(raw, str):
-            return pd.to_datetime(raw).strftime("%Y-%m-%d")
-        if raw > 1e12:
-            return datetime.utcfromtimestamp(raw / 1000).strftime("%Y-%m-%d")
-        return datetime.utcfromtimestamp(raw).strftime("%Y-%m-%d")
+        if isinstance(v, str):
+            return pd.to_datetime(v).strftime("%Y-%m-%d")
+        if v > 1e12:
+            return pd.to_datetime(v / 1000, unit="s").strftime("%Y-%m-%d")
+        return pd.to_datetime(v, unit="s").strftime("%Y-%m-%d")
     except:
         return None
 
@@ -108,13 +102,13 @@ def get_expiries(inst):
         return []
 
     return sorted({
-        safe_expiry(d.get("expiry"))
-        for d in r.json().get("data", [])
-        if safe_expiry(d.get("expiry"))
+        safe_expiry(x.get("expiry"))
+        for x in r.json().get("data", [])
+        if safe_expiry(x.get("expiry"))
     })
 
 # ============================================================
-# OPTION CHAIN (NO CACHE – IMPORTANT)
+# OPTION CHAIN (NO SPOT DEPENDENCY)
 # ============================================================
 def get_chain(inst, expiry):
     r = requests.get(
@@ -133,7 +127,6 @@ def get_chain(inst, expiry):
 
         rows.append({
             "Strike": x.get("strike_price"),
-            "Spot": x.get("underlying_spot_price"),
 
             "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
             "CE_IV": ce.get("option_greeks", {}).get("iv"),
@@ -148,22 +141,22 @@ def get_chain(inst, expiry):
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return df.dropna(subset=["Strike", "Spot"]).sort_values("Strike")
+    return df.dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
 
 # ============================================================
-# COMPOSITE SCORE LOGIC
+# COMPOSITE SCORE
 # ============================================================
-def composite_score(gamma, oi, iv):
-    if gamma <= 0 or oi <= 0 or iv <= 0:
+def composite_score(g, oi, iv):
+    if g <= 0 or oi <= 0 or iv <= 0:
         return None
-    return gamma * math.log1p(oi) * iv
+    return g * math.log1p(oi) * iv
 
 # ============================================================
 # UI
 # ============================================================
-st.markdown("### 🔎 Symbol & Expiry Selection")
+st.markdown("### 🔎 Symbol & Expiry")
 
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns([2.5, 2, 2])
 
 with c1:
     select_all = st.checkbox("✅ Select All Symbols")
@@ -177,56 +170,69 @@ with c2:
         exps = get_expiries(sym_to_inst[symbols[0]])
         expiry = st.selectbox("Expiry", exps) if exps else None
 
+with c3:
+    scalping_mode = st.checkbox("⚡ Intraday Scalping (ATM ±1)", value=False)
+
 run_scan = st.button("🚀 Run Gamma Scan")
 
 # ============================================================
 # MAIN SCAN
 # ============================================================
 if run_scan and symbols and expiry:
-
-    if st.session_state.get("scan_running"):
-        st.warning("Scan already running…")
-        st.stop()
-
-    st.session_state.scan_running = True
     results = []
 
-    with st.spinner("Scanning market for convex opportunities…"):
+    with st.spinner("Scanning gamma convexity…"):
         for sym in symbols:
             df = get_chain(sym_to_inst[sym], expiry)
-            if df.empty:
+            if df.empty or len(df) < 6:
                 continue
 
-            spot = df["Spot"].iloc[0]
-            atm_idx = np.argmin(abs(df["Strike"] - spot))
+            strikes = df["Strike"].values
+            atm_idx = len(strikes) // 2  # SAFE ATM APPROX
 
-            # ITM-3
-            ce_itm = df.iloc[max(atm_idx-3,0):atm_idx]
-            pe_itm = df.iloc[atm_idx+1:atm_idx+4]
+            if scalping_mode:
+                ce_slice = df.iloc[atm_idx-1:atm_idx+1]
+                pe_slice = df.iloc[atm_idx:atm_idx+2]
+            else:
+                ce_slice = df.iloc[atm_idx-3:atm_idx]
+                pe_slice = df.iloc[atm_idx+1:atm_idx+4]
 
-            for side, g, oi, iv in [
-                ("CALL", ce_itm["CE_Gamma"].mean(), ce_itm["CE_OI"].sum(), ce_itm["CE_IV"].mean()),
-                ("PUT",  pe_itm["PE_Gamma"].mean(), pe_itm["PE_OI"].sum(), pe_itm["PE_IV"].mean()),
-            ]:
-                score = composite_score(g, oi, iv)
-                if score:
-                    results.append({
-                        "Symbol": sym,
-                        "Side": side,
-                        "ATM": int(df.iloc[atm_idx]["Strike"]),
-                        "Gamma": round(g, 6),
-                        "OI": int(oi),
-                        "IV": round(iv, 2),
-                        "CompositeScore": round(score, 4)
-                    })
+            ce_g = ce_slice["CE_Gamma"].mean()
+            pe_g = pe_slice["PE_Gamma"].mean()
+
+            ce_score = composite_score(
+                ce_g,
+                ce_slice["CE_OI"].sum(),
+                ce_slice["CE_IV"].mean()
+            )
+            pe_score = composite_score(
+                pe_g,
+                pe_slice["PE_OI"].sum(),
+                pe_slice["PE_IV"].mean()
+            )
+
+            skew = "CALL_DOMINANT" if ce_score and pe_score and ce_score > pe_score else "PUT_DOMINANT"
+
+            if ce_score:
+                results.append({
+                    "Symbol": sym,
+                    "Side": "CALL",
+                    "ATM": int(strikes[atm_idx]),
+                    "CompositeScore": round(ce_score, 4),
+                    "GammaSkew": skew
+                })
+
+            if pe_score:
+                results.append({
+                    "Symbol": sym,
+                    "Side": "PUT",
+                    "ATM": int(strikes[atm_idx]),
+                    "CompositeScore": round(pe_score, 4),
+                    "GammaSkew": skew
+                })
 
             time.sleep(0.12)
 
-    st.session_state.scan_running = False
-
-    # ========================================================
-    # TOP-10 OUTPUT
-    # ========================================================
     if results:
         out = (
             pd.DataFrame(results)
@@ -240,11 +246,6 @@ if run_scan and symbols and expiry:
         buf = BytesIO()
         out.to_excel(buf, index=False)
         buf.seek(0)
-
-        st.download_button(
-            "📥 Download Top-10 Excel",
-            buf,
-            "gamma_top10.xlsx"
-        )
+        st.download_button("📥 Download Excel", buf, "gamma_top10.xlsx")
     else:
-        st.warning("No high-convexity gamma setups found.")
+        st.warning("No high-quality gamma setups found.")
