@@ -1,19 +1,51 @@
-import streamlit as st
-import requests
-import pandas as pd
-import time
+# ============================================================
+# GLOBAL GAMMA EXPANSION & BUYER DOMINANCE SCANNER
+# ============================================================
 
-st.set_page_config(page_title="Futures Depth (Manual Keys)", layout="wide")
-st.title("📊 Futures Market Depth (Manual Keys)")
+import streamlit as st
+import requests, gzip, json, time, os
+import pandas as pd
+import numpy as np
+
+# ============================================================
+# STREAMLIT CONFIG
+# ============================================================
+st.set_page_config(
+    page_title="Global Gamma Expansion Scanner",
+    page_icon="⚡",
+    layout="wide"
+)
+
+st.title("⚡ Global Gamma Expansion & Buyer Dominance Scanner")
+st.caption("Scans ALL underlyings → picks top 20 fastest premium movers based on Gamma Expansion")
 
 BASE_URL = "https://api.upstox.com/v2"
 
+# ============================================================
+# SESSION STATE INIT (AUTO REFRESH & PREV TOP 20)
+# ============================================================
+if "auto_refresh" not in st.session_state:
+    st.session_state["auto_refresh"] = False
+
+if "last_run" not in st.session_state:
+    st.session_state["last_run"] = 0.0
+
+if "prev_top20" not in st.session_state:
+    st.session_state["prev_top20"] = pd.DataFrame()
+
+# ============================================================
+# LOAD ACCESS TOKEN
+# ============================================================
 def load_token():
-    with open("token.txt") as f:
-        t = f.read().strip()
-        if not t:
-            raise ValueError("Empty token")
-        return t
+    try:
+        with open("token.txt", "r") as f:
+            token = f.read().strip()
+            if not token:
+                raise ValueError("Empty token")
+            return token
+    except Exception:
+        st.error("❌ token.txt missing or empty")
+        st.stop()
 
 HEADERS = {
     "Accept": "application/json",
@@ -21,101 +53,336 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
 
-# Put only keys you verified work individually with test script.
-DEFAULT_KEYS = [
-    "NSE_FO:EXIDEIND26FEBFUT",
-    # add more once you test them one by one
-]
+# ============================================================
+# LOAD MASTER → SYMBOL → UNDERLYING_KEY MAP
+# ============================================================
+@st.cache_data(show_spinner=False)
+def load_symbol_map():
+    """
+    Build underlying_symbol → underlying_key (NSE_EQ|.. or NSE_INDEX|..)
+    using NSE_FO rows from complete.json.gz.[web:4][web:18]
+    """
+    if not os.path.isfile("complete.json.gz"):
+        st.error("❌ complete.json.gz not found in current directory")
+        st.stop()
 
-keys_text = st.text_area(
-    "Market-quote futures keys (comma separated)",
-    ",".join(DEFAULT_KEYS),
-    height=80
-)
+    try:
+        with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
+            master = json.load(f)
+    except Exception as e:
+        st.error(f"❌ Error reading complete.json.gz: {e}")
+        st.stop()
 
-bid_filter = st.number_input("Min Total Bid Quantity", min_value=0, value=60)
-ask_filter = st.number_input("Min Total Ask Quantity", min_value=0, value=60)
+    if not isinstance(master, list) or len(master) == 0:
+        st.error("❌ complete.json.gz has no records or invalid structure")
+        st.stop()
 
-auto = st.checkbox("Auto-refresh every 2 min", value=False)
-run = st.button("🚀 Scan")
+    smap = {}
 
-REFRESH_SEC = 120
-if "last_run" not in st.session_state:
-    st.session_state["last_run"] = 0.0
-if "prev_top" not in st.session_state:
-    st.session_state["prev_top"] = pd.DataFrame()
+    for item in master:
+        if item.get("segment") != "NSE_FO":
+            continue
 
-now = time.time()
-do_run = run or (auto and now - st.session_state["last_run"] > REFRESH_SEC)
+        underlying_sym = item.get("underlying_symbol")
+        underlying_key = item.get("underlying_key")
 
-def get_full_quotes(keys):
-    resp = requests.get(
-        f"{BASE_URL}/market-quote/quotes",
+        if (
+            underlying_sym
+            and underlying_key
+            and (underlying_key.startswith("NSE_EQ|") or underlying_key.startswith("NSE_INDEX|"))
+        ):
+            if underlying_sym not in smap:
+                smap[underlying_sym] = underlying_key
+
+    return dict(sorted(smap.items()))
+
+SYMBOL_MAP = load_symbol_map()
+SYMBOLS = list(SYMBOL_MAP.keys())
+
+st.caption(f"🧪 System Check — Underlyings loaded: {len(SYMBOLS)}")
+
+if not SYMBOLS:
+    st.error("❌ No underlyings loaded from complete.json.gz")
+    st.stop()
+
+# ============================================================
+# API CALLS (EXPIRIES & OPTION CHAIN)
+# ============================================================
+@st.cache_data(ttl=300)
+def get_expiries(underlying_inst):
+    """
+    underlying_inst: underlying instrument_key like NSE_EQ|... or NSE_INDEX|Nifty 50.[web:6]
+    """
+    r = requests.get(
+        f"{BASE_URL}/option/contract",
         headers=HEADERS,
-        params={"instrument_key": ",".join(keys), "mode": "full"},
+        params={"instrument_key": underlying_inst},
         timeout=10
     )
-    j = resp.json()
-    st.write("Status:", resp.status_code)
-    st.write("Keys in data:", list(j.get("data", {}).keys()))
-    if resp.status_code != 200:
-        st.error(j)
-        return {}
-    return j.get("data", {})
 
-def parse_one(mk_key, rec):
-    depth = rec.get("depth", {}) or {}
-    buy = depth.get("buy", []) or []
-    sell = depth.get("sell", []) or []
-    ltp = rec.get("last_price") or rec.get("ltp") or 0.0
+    try:
+        j = r.json()
+    except Exception:
+        return []
 
-    tbid = sum(x.get("quantity", 0) for x in buy) or rec.get("total_buy_quantity", 0)
-    task = sum(x.get("quantity", 0) for x in sell) or rec.get("total_sell_quantity", 0)
+    if r.status_code != 200:
+        return []
 
-    return {
-        "MarketKey": mk_key,
-        "Fut_Price": float(ltp),
-        "Total_Bid_Qty": int(tbid or 0),
-        "Total_Ask_Qty": int(task or 0),
-    }
+    data = j.get("data", [])
+    if not data:
+        return []
 
-if do_run:
-    st.session_state["last_run"] = now
+    expiries = set()
+    for d in data:
+        try:
+            expiries.add(pd.to_datetime(d["expiry"]).strftime("%Y-%m-%d"))
+        except Exception:
+            pass
 
-    raw_keys = [k.strip() for k in keys_text.split(",") if k.strip()]
-    data = get_full_quotes(raw_keys)
+    return sorted(expiries)
+
+def pick_focus_expiry(expiry_list):
+    """
+    Pick nearest upcoming expiry (best for intraday/short-term gamma).[web:58]
+    """
+    if not expiry_list:
+        return None
+    today = pd.Timestamp("today").normalize()
+    exps = [pd.to_datetime(x) for x in expiry_list]
+    future = [e for e in exps if e >= today]
+    chosen = min(future) if future else min(exps)
+    return chosen.strftime("%Y-%m-%d")
+
+def get_option_chain(underlying_inst, expiry):
+    r = requests.get(
+        f"{BASE_URL}/option/chain",
+        headers=HEADERS,
+        params={"instrument_key": underlying_inst, "expiry_date": expiry},
+        timeout=10
+    )
+
+    if r.status_code != 200:
+        return pd.DataFrame()
+
+    try:
+        j = r.json()
+    except Exception:
+        return pd.DataFrame()
 
     rows = []
-    for mk in raw_keys:
-        rec = data.get(mk, {})
-        if rec:
-            rows.append(parse_one(mk, rec))
+    for x in j.get("data", []):
+        ce = x.get("call_options") or {}
+        pe = x.get("put_options") or {}
 
-    if not rows:
-        st.error("No depth data for given keys.")
+        rows.append({
+            "Strike": x.get("strike_price"),
+            "Spot": x.get("underlying_spot_price"),
+            "CE_LTP": ce.get("market_data", {}).get("ltp"),
+            "CE_OI": ce.get("market_data", {}).get("oi"),
+            "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
+            "PE_LTP": pe.get("market_data", {}).get("ltp"),
+            "PE_OI": pe.get("market_data", {}).get("oi"),
+            "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    return df.apply(pd.to_numeric, errors="coerce").dropna()
+
+# ============================================================
+# GAMMA ANALYSIS ENGINE
+# ============================================================
+def gamma_engine(df, symbol, expiry):
+    df = df.copy()
+
+    df["CE_GEX"] = df["CE_LTP"] * df["CE_Gamma"] * df["CE_OI"]
+    df["PE_GEX"] = df["PE_LTP"] * df["PE_Gamma"] * df["PE_OI"]
+
+    df["GammaExp"] = df[["CE_GEX", "PE_GEX"]].max(axis=1)
+    df["Side"] = np.where(df["CE_GEX"] > df["PE_GEX"], "CALL", "PUT")
+
+    spot = df["Spot"].iloc[0]
+    df["OTM_Dist"] = abs(df["Strike"] - spot)
+
+    df["GammaChange"] = df["GammaExp"].pct_change()
+    df["PrevSide"] = df["Side"].shift(1)
+
+    df["Alert"] = ""
+
+    # Stop-hunt zone
+    df.loc[
+        (df["OTM_Dist"] > spot * 0.01) &
+        (df["GammaExp"] > df["GammaExp"].quantile(0.85)),
+        "Alert"
+    ] += "🟣 Stop-Hunt "
+
+    # Buyer dominance
+    df.loc[
+        abs(df["CE_GEX"] - df["PE_GEX"]) > df["GammaExp"] * 0.25,
+        "Alert"
+    ] += "🔥 BuyerDom "
+
+    # Fake breakout
+    df.loc[df["GammaChange"] < -0.4, "Alert"] += "⚠ FakeBreak "
+
+    # Gamma flip
+    df.loc[df["Side"] != df["PrevSide"], "Alert"] += "🔄 GammaFlip "
+
+    df["Symbol"] = symbol
+    df["Expiry"] = expiry
+
+    return (
+        df.sort_values("GammaExp", ascending=False)
+        .head(20)
+        [["Symbol", "Expiry", "Strike", "Side", "GammaExp", "OTM_Dist", "Alert"]]
+    )
+
+# ============================================================
+# UI CONTROLS: EXPIRY SELECTION + AUTO REFRESH
+# ============================================================
+col_exp, col_sym, col_auto = st.columns([2, 2, 2])
+
+with col_sym:
+    max_symbols = st.slider(
+        "Max underlyings to scan",
+        10,
+        len(SYMBOLS),
+        min(50, len(SYMBOLS))
+    )
+
+with col_exp:
+    expiry_mode = st.radio(
+        "Expiry selection",
+        ["Nearest expiry", "Select expiry manually"],
+        index=0
+    )
+
+with col_auto:
+    if st.button("⟳ Toggle Auto-Refresh (2 min)"):
+        st.session_state["auto_refresh"] = not st.session_state["auto_refresh"]
+
+st.caption(
+    f"Auto-refresh is **{'ON' if st.session_state['auto_refresh'] else 'OFF'}** "
+    f"(interval: 2 minutes)."
+)
+
+manual_expiry = None
+if expiry_mode == "Select expiry manually":
+    sample_underlying = SYMBOL_MAP[SYMBOLS[0]]
+    sample_exps = get_expiries(sample_underlying)
+    if sample_exps:
+        manual_expiry = st.selectbox("Select global expiry (applied to all symbols)", sample_exps)
     else:
-        df = pd.DataFrame(rows)
-        df_f = df[
-            (df["Total_Bid_Qty"] > bid_filter) &
-            (df["Total_Ask_Qty"] > ask_filter)
-        ]
-        if df_f.empty:
-            st.warning("No contracts meet bid/ask filters.")
+        st.warning("No expiries found for sample underlying; using nearest expiry mode fallback.")
+        expiry_mode = "Nearest expiry"
+
+scan_button = st.button("🚀 Scan Gamma (All Symbols)")
+
+# ============================================================
+# AUTO REFRESH HANDLING (2 MIN)
+# ============================================================
+REFRESH_SEC = 120
+now_ts = time.time()
+
+auto_trigger = False
+if st.session_state["auto_refresh"] and (now_ts - st.session_state["last_run"] > REFRESH_SEC):
+    auto_trigger = True
+
+do_run = scan_button or auto_trigger
+
+# ============================================================
+# EXECUTION: GLOBAL SCAN WITH NEW-STRIKE ALERTS
+# ============================================================
+if do_run:
+    st.session_state["last_run"] = now_ts
+
+    all_results = []
+
+    scan_list = SYMBOLS[:max_symbols]
+
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    for i, sym in enumerate(scan_list, start=1):
+        underlying_key = SYMBOL_MAP.get(sym)
+        if not underlying_key:
+            progress.progress(i / len(scan_list))
+            continue
+
+        exps = get_expiries(underlying_key)
+        if not exps:
+            progress.progress(i / len(scan_list))
+            status.text(f"Skipping {sym} (no expiries)")
+            continue
+
+        if expiry_mode == "Nearest expiry":
+            expiry = pick_focus_expiry(exps)
         else:
-            df_s = df_f.sort_values(
-                ["Total_Bid_Qty", "Total_Ask_Qty"],
-                ascending=[False, False]
-            ).head(20)
+            expiry = manual_expiry
+            if expiry not in exps:
+                progress.progress(i / len(scan_list))
+                status.text(f"Skipping {sym} (selected expiry not available)")
+                continue
 
-            prev = st.session_state["prev_top"]
-            if not prev.empty:
-                prev_set = set(prev["MarketKey"])
-                new_set = set(df_s["MarketKey"])
-                added = new_set - prev_set
-                if added:
-                    st.error("🔔 New futures entered TOP list:")
-                    st.table(df_s[df_s["MarketKey"].isin(added)])
+        if not expiry:
+            progress.progress(i / len(scan_list))
+            status.text(f"Skipping {sym} (no valid expiry)")
+            continue
 
-            st.session_state["prev_top"] = df_s.copy()
-            st.success("Top futures by depth")
-            st.dataframe(df_s, use_container_width=True)
+        df_chain = get_option_chain(underlying_key, expiry)
+        if df_chain.empty:
+            progress.progress(i / len(scan_list))
+            status.text(f"Skipping {sym} (empty chain)")
+            continue
+
+        try:
+            res = gamma_engine(df_chain, sym, expiry)
+            if not res.empty:
+                all_results.append(res)
+                status.text(f"Processed {sym} (expiry {expiry})")
+        except Exception as e:
+            status.text(f"Error on {sym}: {e}")
+
+        progress.progress(i / len(scan_list))
+
+    if not all_results:
+        st.error("No valid gamma data collected for any symbol.")
+    else:
+        big = pd.concat(all_results, ignore_index=True)
+        big_sorted = big.sort_values("GammaExp", ascending=False).head(20)
+
+        # New‑strike alert
+        prev = st.session_state["prev_top20"]
+        new_rows = big_sorted.copy()
+
+        if not prev.empty:
+            prev_keys = set(zip(prev["Symbol"], prev["Expiry"], prev["Strike"], prev["Side"]))
+            new_keys = set(zip(new_rows["Symbol"], new_rows["Expiry"], new_rows["Strike"], new_rows["Side"]))
+            added_keys = new_keys - prev_keys
+
+            if added_keys:
+                added_mask = [
+                    (row.Symbol, row.Expiry, row.Strike, row.Side) in added_keys
+                    for _, row in new_rows.iterrows()
+                ]
+                added_df = new_rows[added_mask]
+                st.error("🔔 New strikes entered TOP 20 list!")
+                st.table(added_df[["Symbol", "Expiry", "Strike", "Side", "GammaExp", "Alert"]])
+
+        st.session_state["prev_top20"] = big_sorted.copy()
+
+        st.success("Top 20 Gamma Expansion Strikes across ALL scanned symbols")
+        st.dataframe(big_sorted, use_container_width=True)
+
+        alerts = big_sorted[big_sorted["Alert"] != ""]
+        if not alerts.empty:
+            st.warning("⚠ Active Gamma Alerts in Global Top 20")
+            st.table(alerts[["Symbol", "Expiry", "Strike", "Side", "Alert"]])
+
+# ============================================================
+# FOOTER
+# ============================================================
+st.markdown("---")
+st.markdown("**Designed by: Gaurav Singh Yadav**  \nOptions | Gamma | Institutional Flow")
