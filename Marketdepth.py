@@ -1,5 +1,5 @@
 # ============================================================
-# FUTURES MARKET DEPTH SCANNER (USING SYMBOL FIELD ONLY)
+# FUTURES MARKET DEPTH SCANNER (DERIVED SYMBOL KEYS)
 # ============================================================
 
 import streamlit as st
@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("📊 Futures Market Depth Scanner (REST Depth Snapshot)")
-st.caption("Uses market-quote/quotes with NSE_FO:SYMBOL keys and depth + total bid/ask filters.")
+st.caption("Uses market-quote/quotes with NSE_FO:SYMBOLFUT keys and depth + total bid/ask filters.")
 
 BASE_URL = "https://api.upstox.com/v2"
 
@@ -50,11 +50,42 @@ HEADERS = {
 # ============================================================
 # FUTURES MAP FROM complete.json.gz
 # ============================================================
+MONTHS = {
+    "JAN": "JAN", "FEB": "FEB", "MAR": "MAR", "APR": "APR",
+    "MAY": "MAY", "JUN": "JUN", "JUL": "JUL", "AUG": "AUG",
+    "SEP": "SEP", "OCT": "OCT", "NOV": "NOV", "DEC": "DEC"
+}
+
+def build_symbol_from_trading(under_sym, trading_symbol):
+    """
+    Convert 'EXIDEIND FUT 24 FEB 26' → 'EXIDEIND26FEBFUT' as seen in your API JSON.[web:92]
+    Pattern in your data:
+      <UNDER> FUT DD MON YY  -> UNDER + DD + MON + FUT
+    """
+    parts = trading_symbol.split()
+    # Expect something like [EXIDEIND, FUT, 24, FEB, 26]
+    if len(parts) < 5:
+        return None
+
+    # Try to find numeric day and 3-letter month
+    day = None
+    mon = None
+    for p in parts:
+        if p.isdigit() and len(p) <= 2:
+            day = p.zfill(2)  # 24 -> '24'
+        elif p.isalpha() and len(p) == 3 and p.upper() in MONTHS:
+            mon = p.upper()
+
+    if not day or not mon:
+        return None
+
+    return f"{under_sym}{day}{mon}FUT"
+
 @st.cache_data(show_spinner=False)
 def load_fut_map():
     """
-    Build: Underlying symbol → market-quote key 'NSE_FO:SYMBOLFUT'
-    using 'symbol' field that matches what full-quote returns.[web:92]
+    Build: underlying_symbol → market-quote key 'NSE_FO:SYMBOLFUT' where
+    SYMBOLFUT is derived from trading_symbol pattern.[web:4][web:92]
     """
     if not os.path.isfile("complete.json.gz"):
         st.error("❌ complete.json.gz not found")
@@ -71,13 +102,16 @@ def load_fut_map():
             continue
 
         under_sym = item.get("underlying_symbol") or item.get("asset_symbol")
-        # This is the exact symbol used by full-quote: e.g. 'EXIDEIND26FEBFUT'[web:92]
-        symbol_field = item.get("symbol")
+        tsym = item.get("trading_symbol")
 
-        if not under_sym or not symbol_field:
+        if not under_sym or not tsym:
             continue
 
-        mk_key = f"NSE_FO:{symbol_field}"
+        symbol_key = build_symbol_from_trading(under_sym, tsym)
+        if not symbol_key:
+            continue
+
+        mk_key = f"NSE_FO:{symbol_key}"
 
         if under_sym not in fut_map:
             fut_map[under_sym] = mk_key
@@ -89,7 +123,7 @@ FUT_SYMBOLS = list(FUT_MAP.keys())
 
 st.caption(f"🧪 System Check — Futures (symbol-based) loaded: {len(FUT_SYMBOLS)}")
 if not FUT_SYMBOLS:
-    st.error("❌ No futures symbol keys built from complete.json.gz")
+    st.error("❌ No futures symbol keys built from complete.json.gz (check trading_symbol pattern)")
     st.stop()
 
 # ============================================================
@@ -134,7 +168,7 @@ def parse_one(sym, mk_key, rec):
     total_bid = sum(l.get("quantity", 0) for l in buy_levels)
     total_ask = sum(l.get("quantity", 0) for l in sell_levels)
 
-    # Also use aggregate totals as backup.[web:92]
+    # Add aggregate totals as backup.[web:92]
     total_bid = total_bid or rec.get("total_buy_quantity", 0)
     total_ask = total_ask or rec.get("total_sell_quantity", 0)
 
@@ -229,7 +263,6 @@ if do_run:
             prev = st.session_state["prev_top20_md"]
             new_rows = df_sorted.copy()
 
-            # New-entry alert
             if not prev.empty:
                 prev_keys = set(zip(prev["Symbol"], prev["MarketKey"]))
                 new_keys = set(zip(new_rows["Symbol"], new_rows["MarketKey"]))
