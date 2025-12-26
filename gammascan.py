@@ -1,9 +1,9 @@
 # ============================================================
-# GAMMA EXPANSION & BUYER DOMINANCE SCANNER (CLEAN FINAL)
+# GAMMA EXPANSION & BUYER DOMINANCE SCANNER (FINAL)
 # ============================================================
 
 import streamlit as st
-import requests, gzip, json, time
+import requests, gzip, json, time, os
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -53,23 +53,42 @@ HEADERS = {
 }
 
 # ============================================================
-# LOAD MASTER → SYMBOL MAP (ROBUST)
+# LOAD MASTER → SYMBOL MAP (ROBUST FOR complete.json.gz)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_symbol_map():
-    with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
-        master = json.load(f)
+    # Ensure file exists where app is running
+    if not os.path.isfile("complete.json.gz"):
+        st.error("❌ complete.json.gz not found in current directory")
+        st.stop()
+
+    try:
+        with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
+            master = json.load(f)
+    except Exception as e:
+        st.error(f"❌ Error reading complete.json.gz: {e}")
+        st.stop()
+
+    if not isinstance(master, list) or len(master) == 0:
+        st.error("❌ complete.json.gz has no records or invalid structure")
+        st.stop()
 
     smap = {}
+
+    # Upstox instruments JSON uses `segment`, `underlying_symbol`, `instrument_key` for F&O.[web:4]
     for item in master:
-        sym = item.get("underlying_symbol")
-        uk = (
-            item.get("underlying_key")
-            or item.get("underlyingInstrumentKey")
-            or item.get("underlyingInstrument_key")
-        )
-        if sym and uk and str(uk).startswith("NSE_FO"):
-            smap.setdefault(sym, uk)
+        seg = item.get("segment")
+        if seg != "NSE_FO":
+            continue
+
+        # Underlying symbol for F&O (e.g., NIFTY, BANKNIFTY, RELIANCE).[web:4]
+        sym = item.get("underlying_symbol") or item.get("trading_symbol")
+        uk = item.get("instrument_key")
+
+        if sym and uk:
+            # Keep first mapping per symbol
+            if sym not in smap:
+                smap[sym] = uk
 
     return dict(sorted(smap.items()))
 
@@ -100,7 +119,7 @@ def get_expiries(inst):
     for d in r.json().get("data", []):
         try:
             expiries.add(pd.to_datetime(d["expiry"]).strftime("%Y-%m-%d"))
-        except:
+        except Exception:
             pass
 
     return sorted(expiries)
