@@ -23,14 +23,16 @@ st.caption("Scans ALL underlyings → picks top 20 fastest premium movers based 
 BASE_URL = "https://api.upstox.com/v2"
 
 # ============================================================
-# AUTO REFRESH (5 MINUTES)
+# SESSION STATE INIT (AUTO REFRESH & PREV TOP 20)
 # ============================================================
-REFRESH_SEC = 300
-now = time.time()
-last = st.session_state.get("last_refresh", 0)
-if now - last > REFRESH_SEC:
-    st.session_state["last_refresh"] = now
-    st.cache_data.clear()
+if "auto_refresh" not in st.session_state:
+    st.session_state["auto_refresh"] = False
+
+if "last_run" not in st.session_state:
+    st.session_state["last_run"] = 0.0
+
+if "prev_top20" not in st.session_state:
+    st.session_state["prev_top20"] = pd.DataFrame()
 
 # ============================================================
 # LOAD ACCESS TOKEN
@@ -73,8 +75,6 @@ def load_symbol_map():
         st.stop()
 
     smap = {}
-
-    # Use NSE_FO rows; take underlying_symbol + underlying_key as underlying instrument.[web:4][web:49]
     for item in master:
         if item.get("segment") != "NSE_FO":
             continue
@@ -104,9 +104,6 @@ if not SYMBOLS:
 # ============================================================
 @st.cache_data(ttl=300)
 def get_expiries(underlying_inst):
-    """
-    underlying_inst: underlying instrument_key like NSE_EQ|... or NSE_INDEX|Nifty 50.[web:6]
-    """
     r = requests.get(
         f"{BASE_URL}/option/contract",
         headers=HEADERS,
@@ -136,15 +133,10 @@ def get_expiries(underlying_inst):
     return sorted(expiries)
 
 def pick_focus_expiry(expiry_list):
-    """
-    Pick nearest upcoming expiry (good for short-term gamma expansion / fast moves).[web:58][web:69]
-    """
     if not expiry_list:
         return None
     today = pd.Timestamp("today").normalize()
-    # Convert to Timestamp
     exps = [pd.to_datetime(x) for x in expiry_list]
-    # Select first expiry >= today, else earliest
     future = [e for e in exps if e >= today]
     chosen = min(future) if future else min(exps)
     return chosen.strftime("%Y-%m-%d")
@@ -193,7 +185,6 @@ def get_option_chain(underlying_inst, expiry):
 def gamma_engine(df, symbol, expiry):
     df = df.copy()
 
-    # Gamma exposure of each side.[web:3][web:63]
     df["CE_GEX"] = df["CE_LTP"] * df["CE_Gamma"] * df["CE_OI"]
     df["PE_GEX"] = df["PE_LTP"] * df["PE_Gamma"] * df["PE_OI"]
 
@@ -208,29 +199,23 @@ def gamma_engine(df, symbol, expiry):
 
     df["Alert"] = ""
 
-    # Stop-hunt zone: strong OTM gamma pockets.
     df.loc[
         (df["OTM_Dist"] > spot * 0.01) &
         (df["GammaExp"] > df["GammaExp"].quantile(0.85)),
         "Alert"
     ] += "🟣 Stop-Hunt "
 
-    # Buyer dominance (strong directional gamma / OI skew).
     df.loc[
         abs(df["CE_GEX"] - df["PE_GEX"]) > df["GammaExp"] * 0.25,
         "Alert"
     ] += "🔥 BuyerDom "
 
-    # Fake breakout (sudden gamma collapse).
     df.loc[df["GammaChange"] < -0.4, "Alert"] += "⚠ FakeBreak "
-
-    # Gamma flip (CALL↔PUT dominance change).
     df.loc[df["Side"] != df["PrevSide"], "Alert"] += "🔄 GammaFlip "
 
     df["Symbol"] = symbol
     df["Expiry"] = expiry
 
-    # Keep strongest strikes for this symbol.
     return (
         df.sort_values("GammaExp", ascending=False)
         .head(20)
@@ -238,23 +223,68 @@ def gamma_engine(df, symbol, expiry):
     )
 
 # ============================================================
-# UI CONTROLS
+# UI CONTROLS: EXPIRY SELECTION + AUTO REFRESH
 # ============================================================
-col1, col2 = st.columns(2)
-with col1:
-    max_symbols = st.slider("Max underlyings to scan (for speed)", 10, len(SYMBOLS), min(50, len(SYMBOLS)))
-with col2:
-    scan_button = st.button("🚀 Scan All Symbols (Gamma Expansion)")
+col_exp, col_sym, col_auto = st.columns([2, 2, 2])
 
-st.caption("Note: Scanning many symbols may hit rate limits; start with 30–50 for faster runs.[web:66]")
+with col_sym:
+    max_symbols = st.slider(
+        "Max underlyings to scan",
+        10,
+        len(SYMBOLS),
+        min(50, len(SYMBOLS))
+    )
+
+with col_exp:
+    expiry_mode = st.radio(
+        "Expiry selection",
+        ["Nearest expiry", "Select expiry manually"],
+        index=0
+    )
+
+with col_auto:
+    if st.button("⟳ Toggle Auto-Refresh (2 min)"):
+        st.session_state["auto_refresh"] = not st.session_state["auto_refresh"]
+
+st.caption(
+    f"Auto-refresh is **{'ON' if st.session_state['auto_refresh'] else 'OFF'}** "
+    f"(interval: 2 minutes)."
+)
+
+# manual expiry selection per RUN (single expiry for all symbols)
+manual_expiry = None
+if expiry_mode == "Select expiry manually":
+    # Use first symbol that has expiries just to populate the list
+    sample_underlying = SYMBOL_MAP[SYMBOLS[0]]
+    sample_exps = get_expiries(sample_underlying)
+    if sample_exps:
+        manual_expiry = st.selectbox("Select global expiry (applied to all symbols)", sample_exps)
+    else:
+        st.warning("No expiries found for sample underlying; using nearest expiry mode fallback.")
+        expiry_mode = "Nearest expiry"
+
+scan_button = st.button("🚀 Scan Gamma (All Symbols)")
 
 # ============================================================
-# EXECUTION: GLOBAL SCAN
+# AUTO REFRESH HANDLING (2 MIN)
 # ============================================================
-if scan_button:
+REFRESH_SEC = 120
+now_ts = time.time()
+
+# If auto_refresh ON and last_run older than interval, trigger scan
+auto_trigger = False
+if st.session_state["auto_refresh"] and (now_ts - st.session_state["last_run"] > REFRESH_SEC):
+    auto_trigger = True
+
+do_run = scan_button or auto_trigger
+
+# ============================================================
+# EXECUTION: GLOBAL SCAN (WITH ALERT FOR NEW STRIKES)
+# ============================================================
+if do_run:
+    st.session_state["last_run"] = now_ts
+
     all_results = []
-
-    # Limit symbols for performance
     scan_list = SYMBOLS[:max_symbols]
 
     progress = st.progress(0.0)
@@ -263,30 +293,35 @@ if scan_button:
     for i, sym in enumerate(scan_list, start=1):
         underlying_key = SYMBOL_MAP.get(sym)
         if not underlying_key:
+            progress.progress(i / len(scan_list))
             continue
 
-        # 1) Get expiries & choose focus expiry
         exps = get_expiries(underlying_key)
         if not exps:
-            # No options exposed via API for this underlying
             progress.progress(i / len(scan_list))
             status.text(f"Skipping {sym} (no expiries)")
             continue
 
-        expiry = pick_focus_expiry(exps)
+        if expiry_mode == "Nearest expiry":
+            expiry = pick_focus_expiry(exps)
+        else:
+            expiry = manual_expiry
+            if expiry not in exps:
+                progress.progress(i / len(scan_list))
+                status.text(f"Skipping {sym} (selected expiry not available)")
+                continue
+
         if not expiry:
             progress.progress(i / len(scan_list))
             status.text(f"Skipping {sym} (no valid expiry)")
             continue
 
-        # 2) Get option chain for that expiry
         df_chain = get_option_chain(underlying_key, expiry)
         if df_chain.empty:
             progress.progress(i / len(scan_list))
             status.text(f"Skipping {sym} (empty chain)")
             continue
 
-        # 3) Run gamma engine for this symbol
         try:
             res = gamma_engine(df_chain, sym, expiry)
             if not res.empty:
@@ -300,9 +335,30 @@ if scan_button:
     if not all_results:
         st.error("No valid gamma data collected for any symbol.")
     else:
-        # Concatenate all and take global top 20 by GammaExp
         big = pd.concat(all_results, ignore_index=True)
         big_sorted = big.sort_values("GammaExp", ascending=False).head(20)
+
+        # ============================
+        # ALERT: NEW STRIKES IN TOP 20
+        # ============================
+        prev = st.session_state["prev_top20"]
+        new_rows = big_sorted.copy()
+
+        if not prev.empty:
+            prev_keys = set(zip(prev["Symbol"], prev["Expiry"], prev["Strike"], prev["Side"]))
+            new_keys = set(zip(new_rows["Symbol"], new_rows["Expiry"], new_rows["Strike"], new_rows["Side"]))
+            added_keys = new_keys - prev_keys
+
+            if added_keys:
+                added_mask = [
+                    (row.Symbol, row.Expiry, row.Strike, row.Side) in added_keys
+                    for _, row in new_rows.iterrows()
+                ]
+                added_df = new_rows[added_mask]
+                st.error("🔔 New strikes entered TOP 20 list!")
+                st.table(added_df[["Symbol", "Expiry", "Strike", "Side", "GammaExp", "Alert"]])
+
+        st.session_state["prev_top20"] = big_sorted.copy()
 
         st.success("Top 20 Gamma Expansion Strikes across ALL scanned symbols")
         st.dataframe(big_sorted, use_container_width=True)
