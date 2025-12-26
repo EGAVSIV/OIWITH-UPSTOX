@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 from typing import Optional
 from io import BytesIO
-import os 
+import os
 
 # ============================================================
 # STREAMLIT CONFIG
@@ -32,25 +32,20 @@ st.caption("Pure Gamma | ITM-3 | High Convexity Option Trades")
 UP_BASE = "https://api.upstox.com/v2"
 
 def load_access_token():
-    # First try Streamlit secrets
     if "UPSTOX_TOKEN" in st.secrets:
         return st.secrets["UPSTOX_TOKEN"]
 
-    # Fallback to local file
     token_path = "token.txt"
     if not os.path.exists(token_path):
-        st.error("❌ token.txt not found and UPSTOX_TOKEN not set")
+        st.error("❌ UPSTOX_TOKEN not found (Secrets / token.txt)")
         st.stop()
 
-    with open(token_path, "r", encoding="utf-8") as f:
-        token = f.read().strip()
-
+    token = open(token_path).read().strip()
     if not token:
-        st.error("❌ Access token is empty")
+        st.error("❌ Access token empty")
         st.stop()
 
     return token
-
 
 ACCESS_TOKEN = load_access_token()
 
@@ -60,21 +55,16 @@ UP_HEADERS = {
 }
 
 # ============================================================
-# LOAD MASTER FILE (UNDERLYING MAP)
+# LOAD MASTER FILE
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_master(path="complete.json.gz"):
     if not os.path.exists(path):
-        st.error("❌ complete.json.gz not found in repository root")
+        st.error("❌ complete.json.gz not found in repo root")
         st.stop()
 
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        st.error(f"❌ Failed to read master file: {e}")
-        st.stop()
-
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return json.load(f)
 
 master_data = load_master()
 
@@ -92,47 +82,48 @@ for item in master_data:
 ALL_SYMBOLS = sorted(symbol_map.keys())
 
 # ============================================================
-# SPOT PRICE (UPSTOX – OFFICIAL)
+# SPOT PRICE (UPSTOX)
 # ============================================================
 @st.cache_data(ttl=20)
 def get_spot_price(symbol: str) -> Optional[float]:
-    instrument_key = symbol_map.get(symbol)
-    if not instrument_key:
+    ik = symbol_map.get(symbol)
+    if not ik:
         return None
 
-    url = f"{UP_BASE}/market-quote/ltp"
     r = requests.get(
-        url,
+        f"{UP_BASE}/market-quote/ltp",
         headers=UP_HEADERS,
-        params={"instrument_key": instrument_key},
+        params={"instrument_key": ik},
         timeout=10
     )
 
     if r.status_code != 200:
         return None
 
-    data = r.json().get("data", {})
-    price = data.get(instrument_key, {}).get("last_price")
-    return float(price) if price else None
+    return r.json().get("data", {}).get(ik, {}).get("last_price")
 
 # ============================================================
 # EXPIRY LIST
 # ============================================================
 @st.cache_data(ttl=300)
-def get_expiry_list(symbol):
-    url = f"{UP_BASE}/option/contract"
+def get_expiry_list(symbol: str):
+    ik = symbol_map.get(symbol)
+    if not ik:
+        return []
+
     r = requests.get(
-        url,
+        f"{UP_BASE}/option/contract",
         headers=UP_HEADERS,
-        params={"instrument_key": symbol_map[symbol]},
+        params={"instrument_key": ik},
         timeout=10
     )
+
     if r.status_code != 200:
         return []
 
     expiries = set()
-    for i in r.json().get("data", []):
-        raw = i.get("expiry")
+    for row in r.json().get("data", []):
+        raw = row.get("expiry")
         if raw:
             expiries.add(pd.to_datetime(raw).strftime("%Y-%m-%d"))
 
@@ -143,9 +134,8 @@ def get_expiry_list(symbol):
 # ============================================================
 @st.cache_data(ttl=30)
 def get_option_chain(symbol, expiry):
-    url = f"{UP_BASE}/option/chain"
     r = requests.get(
-        url,
+        f"{UP_BASE}/option/chain",
         headers=UP_HEADERS,
         params={
             "instrument_key": symbol_map[symbol],
@@ -159,8 +149,8 @@ def get_option_chain(symbol, expiry):
 
     rows = []
     for row in r.json().get("data", []):
-        ce = row.get("call_options", {})
-        pe = row.get("put_options", {})
+        ce = row.get("call_options") or {}
+        pe = row.get("put_options") or {}
 
         rows.append({
             "Strike": row.get("strike_price"),
@@ -175,45 +165,56 @@ def get_option_chain(symbol, expiry):
     return df.sort_values("Strike").reset_index(drop=True)
 
 # ============================================================
-# ITM-3 GAMMA EXTRACTION
+# ITM-3 GAMMA LOGIC
 # ============================================================
 def extract_itm3_gamma(df, spot):
     strikes = df["Strike"].values
     atm_idx = int(np.argmin(np.abs(strikes - spot)))
 
-    ce_itm = df.iloc[max(atm_idx-3, 0):atm_idx]["CE_Gamma"].dropna()
-    pe_itm = df.iloc[atm_idx+1:atm_idx+4]["PE_Gamma"].dropna()
+    ce_itm = df.iloc[max(atm_idx - 3, 0):atm_idx]["CE_Gamma"].dropna()
+    pe_itm = df.iloc[atm_idx + 1:atm_idx + 4]["PE_Gamma"].dropna()
 
-    atm_strike = df.iloc[atm_idx]["Strike"]
-    return ce_itm, pe_itm, atm_strike
+    return ce_itm, pe_itm, df.iloc[atm_idx]["Strike"]
 
 # ============================================================
-# UI
+# UI – SYMBOL + EXPIRY
 # ============================================================
 st.markdown("### 🔎 Select Symbols & Expiry")
 
 c1, c2 = st.columns(2)
 
 with c1:
-    symbols = st.multiselect("Symbols", ALL_SYMBOLS, ["NIFTY"])
+    select_all = st.checkbox("✅ Select All Symbols")
+
+    if select_all:
+        symbols = ALL_SYMBOLS
+    else:
+        symbols = st.multiselect("Symbols", ALL_SYMBOLS, default=["NIFTY"])
 
 with c2:
     expiry = None
     if symbols:
         expiry_list = get_expiry_list(symbols[0])
-        expiry = st.selectbox("Expiry", expiry_list)
+
+        if not expiry_list:
+            st.warning(
+                f"No option expiries found for {symbols[0]} "
+                "(symbol may not be optionable)"
+            )
+        else:
+            expiry = st.selectbox("Expiry", expiry_list)
 
 run_gamma = st.button("🚀 Gamma Scan")
 
 # ============================================================
-# GAMMA SCAN LOGIC
+# MAIN SCAN LOGIC
 # ============================================================
 if run_gamma and symbols and expiry:
     results = []
 
     for sym in symbols:
         spot = get_spot_price(sym)
-        if spot is None:
+        if not spot:
             continue
 
         chain = get_option_chain(sym, expiry)
@@ -225,33 +226,33 @@ if run_gamma and symbols and expiry:
         ce_score = ce_itm.mean() if len(ce_itm) == 3 else None
         pe_score = pe_itm.mean() if len(pe_itm) == 3 else None
 
-        ce_thresh = np.nanpercentile(chain["CE_Gamma"].dropna(), 75)
-        pe_thresh = np.nanpercentile(chain["PE_Gamma"].dropna(), 75)
+        ce_thr = np.nanpercentile(chain["CE_Gamma"].dropna(), 75)
+        pe_thr = np.nanpercentile(chain["PE_Gamma"].dropna(), 75)
 
-        if ce_score and ce_score > ce_thresh:
+        if ce_score and ce_score > ce_thr:
             results.append({
                 "Symbol": sym,
-                "Strike Name": f"{sym} {int(atm_strike)} CE - Exp {expiry}",
+                "Strike": f"{sym} {int(atm_strike)} CE",
                 "Side": "CALL",
                 "GammaScore": round(ce_score, 6),
                 "Bias": "Upside Premium Expansion"
             })
 
-        if pe_score and pe_score > pe_thresh:
+        if pe_score and pe_score > pe_thr:
             results.append({
                 "Symbol": sym,
-                "Strike Name": f"{sym} {int(atm_strike)} PE - Exp {expiry}",
+                "Strike": f"{sym} {int(atm_strike)} PE",
                 "Side": "PUT",
                 "GammaScore": round(pe_score, 6),
                 "Bias": "Downside Premium Expansion"
             })
 
-        time.sleep(0.15)
+        time.sleep(0.25)  # rate-limit safe
 
     if results:
         out = pd.DataFrame(results).sort_values("GammaScore", ascending=False)
         st.success(f"🔥 Gamma Opportunities Found: {len(out)}")
-        st.dataframe(out, use_container_width=True)
+        st.dataframe(out, width="stretch")
 
         buf = BytesIO()
         out.to_excel(buf, index=False)
