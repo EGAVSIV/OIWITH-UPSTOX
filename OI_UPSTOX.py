@@ -137,20 +137,22 @@ except Exception as e:
     st.stop()
 
 unique_underlyings = sorted({ item.get("underlying_symbol") for item in master_data if item.get("underlying_symbol") })
-symbol_map = {}
-underlying_meta = {}
-for sym in unique_underlyings:
-    for item in master_data:
-        if item.get("underlying_symbol") != sym:
-            continue
-        uk = item.get("underlying_key") or item.get("underlyingInstrumentKey") or item.get("underlyingInstrument_key")
-        if uk:
-            symbol_map[sym] = uk
-            underlying_meta[sym] = item
-            break
-if not symbol_map:
-    st.error("No underlyings found in master file.")
-    st.stop()
+SYMBOL_MAP = {}
+
+for item in master:
+    sym = item.get("underlying_symbol")
+    uk = (
+        item.get("underlying_key")
+        or item.get("underlyingInstrumentKey")
+        or item.get("underlyingInstrument_key")
+    )
+
+    if not sym or not uk:
+        continue
+
+    if str(uk).startswith("NSE_FO"):
+        SYMBOL_MAP.setdefault(sym, uk)
+
 
 # -------------------- API CALLS --------------------
 def get_expiries(instrument_key: str) -> list:
