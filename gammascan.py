@@ -74,7 +74,7 @@ except Exception as e:
     st.stop()
 
 # ============================================================
-# BUILD EQ & FO MAPS (CRITICAL FIX)
+# BUILD EQ & FO MAPS (CRITICAL)
 # ============================================================
 eq_map = {}
 fo_map = {}
@@ -197,7 +197,7 @@ def extract_itm3_gamma(df: pd.DataFrame, spot: float):
     return ce_itm, pe_itm, df.iloc[atm_idx]["Strike"]
 
 # ============================================================
-# UI – SYMBOL + EXPIRY
+# UI – SYMBOL + EXPIRY (OPTION-1 FIX)
 # ============================================================
 st.markdown("### 🔎 Select Symbols & Expiry")
 
@@ -205,9 +205,15 @@ c1, c2 = st.columns(2)
 
 with c1:
     select_all = st.checkbox("✅ Select All Symbols")
-    symbols = ALL_SYMBOLS if select_all else st.multiselect(
-        "Symbols", ALL_SYMBOLS, default=["NIFTY"]
-    )
+
+    if select_all:
+        symbols = ALL_SYMBOLS
+    else:
+        symbols = st.multiselect(
+            "Symbols",
+            ALL_SYMBOLS,
+            default=ALL_SYMBOLS[:1] if ALL_SYMBOLS else []
+        )
 
 with c2:
     expiry = None
