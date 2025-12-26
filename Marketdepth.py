@@ -5,8 +5,6 @@
 import streamlit as st
 import requests, gzip, json, time, os
 import pandas as pd
-import numpy as np
-from datetime import datetime
 
 st.set_page_config(
     page_title="Futures Market Depth Scanner",
@@ -57,8 +55,8 @@ HEADERS = {
 @st.cache_data(show_spinner=False)
 def load_fut_map():
     """
-    Build a map: Symbol → FUT instrument_key (NSE_FO futures).
-    Upstox instruments JSON: segment = 'NSE_FO', instrument_type = 'FUT' for futures.[web:4][web:18]
+    Symbol → FUT instrument_key (NSE_FO futures).
+    Upstox JSON: segment='NSE_FO', instrument_type='FUT' for futures.[web:4][web:18]
     """
     if not os.path.isfile("complete.json.gz"):
         st.error("❌ complete.json.gz not found")
@@ -77,20 +75,15 @@ def load_fut_map():
 
     fut_map = {}
     for item in master:
-        # 1) Futures segment
         if item.get("segment") != "NSE_FO":
             continue
-
-        # 2) Futures instrument_type in Upstox JSON is 'FUT'[web:4]
-        if item.get("instrument_type") != "FUT":
+        if item.get("instrument_type") != "FUT":  # futures only[web:4]
             continue
 
-        # 3) Pick a symbol – prefer underlying_symbol, else trading_symbol
         sym = item.get("underlying_symbol") or item.get("trading_symbol")
         ikey = item.get("instrument_key")
 
         if sym and ikey:
-            # Keep first (likely nearest expiry) per symbol
             if sym not in fut_map:
                 fut_map[sym] = ikey
 
@@ -111,8 +104,7 @@ if not FUT_SYMBOLS:
 @st.cache_data(ttl=5)
 def get_market_depth(instrument_keys):
     """
-    Use Full Market Quote endpoint to get depth (top 5 buy/sell + total quantities).[web:92]
-    instrument_keys: list of FUT instrument keys
+    Full Market Quotes for up to 500 keys.[web:92][web:124]
     """
     if not instrument_keys:
         return {}
@@ -134,20 +126,24 @@ def get_market_depth(instrument_keys):
     except Exception:
         return {}
 
+    # data is dict keyed by EXACT instrument_key string passed.[web:92][web:124]
     return j.get("data", {})
 
 def parse_depth(sym, ikey, record):
-    """
-    Extract futures price and bid/ask totals from full quote record.
-    """
     depth = record.get("depth", {}) or {}
     buy_levels = depth.get("buy", []) or []
     sell_levels = depth.get("sell", []) or []
 
-    ltp = record.get("ltp") or record.get("last_price") or 0.0
+    ltp = record.get("last_price") or record.get("ltp") or 0.0
 
-    total_buy = sum([lvl.get("quantity", 0) for lvl in buy_levels])
-    total_sell = sum([lvl.get("quantity", 0) for lvl in sell_levels])
+    total_buy = sum(lvl.get("quantity", 0) for lvl in buy_levels)
+    total_sell = sum(lvl.get("quantity", 0) for lvl in sell_levels)
+
+    # Fallback to total_buy_quantity / total_sell_quantity if depth arrays are empty.[web:92]
+    if total_buy == 0:
+        total_buy = record.get("total_buy_quantity", 0)
+    if total_sell == 0:
+        total_sell = record.get("total_sell_quantity", 0)
 
     return {
         "Symbol": sym,
@@ -178,7 +174,7 @@ if st.button("⟳ Toggle Auto-Refresh (2 min)"):
 
 st.caption(
     f"Auto-refresh is **{'ON' if st.session_state['auto_refresh'] else 'OFF'}** "
-    f"(interval: 2 minutes). Depth uses full quote with top-5 levels.[web:92][web:96]"
+    f"(interval: 2 minutes). Depth uses full quote with top-5 levels or total quantities.[web:92][web:96]"
 )
 
 scan_button = st.button("🚀 Scan Futures Market Depth")
@@ -212,8 +208,8 @@ if do_run:
     for i, sym in enumerate(scan_list, start=1):
         ikey = FUT_MAP[sym]
 
-        # Upstox keys in quote data may be "NSE_FO:XXX" or "NSE_FO|XXX"; check both.[web:92]
-        rec = data.get(ikey.replace("|", ":"), {}) or data.get(ikey, {})
+        # IMPORTANT: keys are exactly the same instrument_key strings you passed.[web:92][web:124]
+        rec = data.get(ikey, {})
 
         if rec:
             parsed = parse_depth(sym, ikey, rec)
@@ -227,7 +223,6 @@ if do_run:
     else:
         df = pd.DataFrame(rows)
 
-        # Your filter: Total Bid > 60 AND Total Ask > 60 (can change thresholds in UI)
         df_filt = df[
             (df["Total_Bid_Qty"] > bid_filter) &
             (df["Total_Ask_Qty"] > ask_filter)
@@ -236,13 +231,11 @@ if do_run:
         if df_filt.empty:
             st.warning("No instruments meet the bid/ask filters.")
         else:
-            # Rank by depth; here by Total_Bid_Qty and then Total_Ask_Qty
             df_sorted = df_filt.sort_values(
                 ["Total_Bid_Qty", "Total_Ask_Qty"],
                 ascending=[False, False]
             ).head(20)
 
-            # ALERT: new futures appeared in top 20
             prev = st.session_state["prev_top20_md"]
             new_rows = df_sorted.copy()
 
