@@ -1,6 +1,5 @@
 # ============================================================
-# GAMMA EXPANSION & BUYER DOMINANCE SCANNER (PRO)
-# Auto Refresh | Top 20 Gamma Strikes | Alerts
+# GAMMA EXPANSION & BUYER DOMINANCE SCANNER (CLEAN FINAL)
 # ============================================================
 
 import streamlit as st
@@ -19,26 +18,33 @@ st.set_page_config(
 )
 
 st.title("⚡ Gamma Expansion & Buyer Dominance Scanner")
-st.caption("Pure Gamma × OI × Price | Institutional Move Detector")
+st.caption("Gamma × OI × Price | Stop-Hunt | Fake Breakout | Gamma Flip")
 
 BASE_URL = "https://api.upstox.com/v2"
 
 # ============================================================
-# AUTO REFRESH (5 MIN)
+# AUTO REFRESH (5 MINUTES)
 # ============================================================
-AUTO_REFRESH_SEC = 300
+REFRESH_SEC = 300
 now = time.time()
 last = st.session_state.get("last_refresh", 0)
-if now - last > AUTO_REFRESH_SEC:
+if now - last > REFRESH_SEC:
     st.session_state["last_refresh"] = now
     st.cache_data.clear()
 
 # ============================================================
-# ACCESS TOKEN
+# LOAD ACCESS TOKEN
 # ============================================================
 def load_token():
-    with open("token.txt") as f:
-        return f.read().strip()
+    try:
+        with open("token.txt", "r") as f:
+            token = f.read().strip()
+            if not token:
+                raise ValueError("Empty token")
+            return token
+    except Exception:
+        st.error("❌ token.txt missing or empty")
+        st.stop()
 
 HEADERS = {
     "Accept": "application/json",
@@ -47,7 +53,7 @@ HEADERS = {
 }
 
 # ============================================================
-# LOAD MASTER (ROBUST)
+# LOAD MASTER → SYMBOL MAP (ROBUST)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_symbol_map():
@@ -55,19 +61,26 @@ def load_symbol_map():
         master = json.load(f)
 
     smap = {}
-    for x in master:
-        sym = x.get("underlying_symbol")
+    for item in master:
+        sym = item.get("underlying_symbol")
         uk = (
-            x.get("underlying_key")
-            or x.get("underlyingInstrumentKey")
-            or x.get("underlyingInstrument_key")
+            item.get("underlying_key")
+            or item.get("underlyingInstrumentKey")
+            or item.get("underlyingInstrument_key")
         )
         if sym and uk and str(uk).startswith("NSE_FO"):
             smap.setdefault(sym, uk)
+
     return dict(sorted(smap.items()))
 
 SYMBOL_MAP = load_symbol_map()
-symbols = list(SYMBOL_MAP.keys())
+SYMBOLS = list(SYMBOL_MAP.keys())
+
+st.caption(f"🧪 System Check — Symbols loaded: {len(SYMBOLS)}")
+
+if not SYMBOLS:
+    st.error("❌ No symbols loaded from complete.json.gz")
+    st.stop()
 
 # ============================================================
 # API CALLS
@@ -80,21 +93,33 @@ def get_expiries(inst):
         params={"instrument_key": inst},
         timeout=10
     )
-    return sorted({
-        pd.to_datetime(d["expiry"]).strftime("%Y-%m-%d")
-        for d in r.json().get("data", []) if d.get("expiry")
-    })
+    if r.status_code != 200:
+        return []
 
-def get_chain(inst, expiry):
+    expiries = set()
+    for d in r.json().get("data", []):
+        try:
+            expiries.add(pd.to_datetime(d["expiry"]).strftime("%Y-%m-%d"))
+        except:
+            pass
+
+    return sorted(expiries)
+
+def get_option_chain(inst, expiry):
     r = requests.get(
         f"{BASE_URL}/option/chain",
         headers=HEADERS,
         params={"instrument_key": inst, "expiry_date": expiry},
         timeout=10
     )
+    if r.status_code != 200:
+        return pd.DataFrame()
+
     rows = []
     for x in r.json().get("data", []):
-        ce, pe = x.get("call_options", {}), x.get("put_options", {})
+        ce = x.get("call_options") or {}
+        pe = x.get("put_options") or {}
+
         rows.append({
             "Strike": x.get("strike_price"),
             "Spot": x.get("underlying_spot_price"),
@@ -105,6 +130,7 @@ def get_chain(inst, expiry):
             "PE_OI": pe.get("market_data", {}).get("oi"),
             "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
         })
+
     df = pd.DataFrame(rows)
     return df.apply(pd.to_numeric, errors="coerce").dropna()
 
@@ -114,7 +140,6 @@ def get_chain(inst, expiry):
 def gamma_engine(df, symbol, expiry):
     df = df.copy()
 
-    # Gamma Exposure
     df["CE_GEX"] = df["CE_LTP"] * df["CE_Gamma"] * df["CE_OI"]
     df["PE_GEX"] = df["PE_LTP"] * df["PE_Gamma"] * df["PE_OI"]
 
@@ -124,28 +149,29 @@ def gamma_engine(df, symbol, expiry):
     spot = df["Spot"].iloc[0]
     df["OTM_Dist"] = abs(df["Strike"] - spot)
 
-    # Alerts
+    df["GammaChange"] = df["GammaExp"].pct_change()
+    df["PrevSide"] = df["Side"].shift(1)
+
     df["Alert"] = ""
 
-    # Stop Hunt Zone
+    # Stop-hunt zone
     df.loc[
-        (df["OTM_Dist"] > spot * 0.01) & (df["GammaExp"] > df["GammaExp"].quantile(0.85)),
+        (df["OTM_Dist"] > spot * 0.01) &
+        (df["GammaExp"] > df["GammaExp"].quantile(0.85)),
         "Alert"
-    ] = "🟣 Stop-Hunt Zone"
+    ] += "🟣 Stop-Hunt "
 
-    # Buyer Dominance
+    # Buyer dominance
     df.loc[
         abs(df["CE_GEX"] - df["PE_GEX"]) > df["GammaExp"] * 0.25,
         "Alert"
-    ] += " 🔥 Buyer Dominance"
+    ] += "🔥 BuyerDom "
 
-    # Fake Breakout
-    df["GammaChange"] = df["GammaExp"].pct_change()
-    df.loc[df["GammaChange"] < -0.4, "Alert"] += " ⚠ Fake Breakout"
+    # Fake breakout
+    df.loc[df["GammaChange"] < -0.4, "Alert"] += "⚠ FakeBreak "
 
-    # Trend Reversal
-    df["PrevSide"] = df["Side"].shift(1)
-    df.loc[df["Side"] != df["PrevSide"], "Alert"] += " 🔄 Gamma Flip"
+    # Gamma flip
+    df.loc[df["Side"] != df["PrevSide"], "Alert"] += "🔄 GammaFlip "
 
     df["Symbol"] = symbol
     df["Expiry"] = expiry
@@ -159,8 +185,19 @@ def gamma_engine(df, symbol, expiry):
 # ============================================================
 # UI
 # ============================================================
-symbol = st.selectbox("Select Symbol", symbols)
-expiry = st.selectbox("Select Expiry", get_expiries(SYMBOL_MAP[symbol]))
+symbol = st.selectbox("Select Symbol", SYMBOLS, key="symbol_select")
+
+instrument_key = SYMBOL_MAP.get(symbol)
+if not instrument_key:
+    st.error("Instrument key not found")
+    st.stop()
+
+expiry_list = get_expiries(instrument_key)
+if not expiry_list:
+    st.error("No expiries available")
+    st.stop()
+
+expiry = st.selectbox("Select Expiry", expiry_list, key="expiry_select")
 
 run = st.button("🚀 Scan Gamma")
 
@@ -168,14 +205,18 @@ run = st.button("🚀 Scan Gamma")
 # EXECUTION
 # ============================================================
 if run:
-    df = get_chain(SYMBOL_MAP[symbol], expiry)
-    out = gamma_engine(df, symbol, expiry)
+    df = get_option_chain(instrument_key, expiry)
 
-    st.success("Top Gamma Expansion Strikes")
-    st.dataframe(out, use_container_width=True)
+    if df.empty:
+        st.error("Option chain empty")
+        st.stop()
 
-    # Alerts
-    alerts = out[out["Alert"] != ""]
+    result = gamma_engine(df, symbol, expiry)
+
+    st.success("Top 20 Gamma Expansion Strikes")
+    st.dataframe(result, use_container_width=True)
+
+    alerts = result[result["Alert"] != ""]
     if not alerts.empty:
         st.warning("⚠ Active Gamma Alerts")
         st.table(alerts[["Strike", "Side", "Alert"]])
