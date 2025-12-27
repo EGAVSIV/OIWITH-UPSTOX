@@ -231,8 +231,10 @@ st.title("📈 Upstox Option Chain Analysis — Display & Suggestions")
 st.markdown("Small UI settings — tweak filters and thresholds below:")
 
 # SYMBOL / EXPIRY
-symbol = st.selectbox("Select Symbol", sorted(symbol_map.keys()))
-instrument_key = symbol_map[symbol]
+symbol = st.selectbox("Select Symbol", sorted(SYMBOL_MAP.keys()))
+
+instrument_key = SYMBOL_MAP[symbol]
+
 meta = underlying_meta.get(symbol, {})
 
 expiries = get_expiries(instrument_key)
