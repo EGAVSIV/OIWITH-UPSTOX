@@ -1,5 +1,5 @@
 # ============================================================
-# UPSTOX OPTION CHAIN ANALYSIS — CLEAN & STABLE VERSION
+# UPSTOX OPTION CHAIN ANALYSIS — FINAL STABLE VERSION
 # ============================================================
 
 import streamlit as st
@@ -23,7 +23,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# LOGIN
+# LOGIN SYSTEM
 # ============================================================
 def hash_pwd(pwd):
     return hashlib.sha256(pwd.encode()).hexdigest()
@@ -35,7 +35,6 @@ if "authenticated" not in st.session_state:
 
 if not st.session_state.authenticated:
     st.title("🔐 Login Required")
-
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
 
@@ -73,7 +72,7 @@ if auto_refresh:
         st.rerun()
 
 # ============================================================
-# UPSTOX TOKEN
+# ACCESS TOKEN
 # ============================================================
 def load_access_token(path="token.txt"):
     try:
@@ -97,14 +96,6 @@ HEADERS = {
 BASE_URL = "https://api.upstox.com/v2"
 
 # ============================================================
-# PARAMETERS
-# ============================================================
-IV_SPIKE_THRESHOLD = 20
-IV_CRUSH_THRESHOLD = -20
-PCR_MIN, PCR_MAX = 0.0, 2.0
-W_IV, W_DELTA, W_OI = 0.4, 0.3, 0.3
-
-# ============================================================
 # HELPERS
 # ============================================================
 def safe_get(d, *keys, default=0):
@@ -122,7 +113,7 @@ def ts_to_ymd(v):
         return None
 
 # ============================================================
-# LOAD MASTER FILE
+# LOAD MASTER FILE (ROBUST)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_master(path="complete.json.gz"):
@@ -132,19 +123,40 @@ def load_master(path="complete.json.gz"):
 try:
     master_data = load_master()
 except Exception as e:
-    st.error(f"Master file error: {e}")
+    st.error(f"❌ Failed to load master file: {e}")
     st.stop()
 
+# ============================================================
+# BUILD SYMBOL MAP (WORKS WITH ALL UPSTOX FILES)
+# ============================================================
 SYMBOL_MAP = {}
+
 for item in master_data:
-    sym = item.get("underlying_symbol")
+    sym = (
+        item.get("underlying_symbol")
+        or item.get("symbol")
+        or item.get("trading_symbol")
+    )
+
     key = (
         item.get("underlying_key")
+        or item.get("instrument_key")
+        or item.get("instrumentKey")
         or item.get("underlyingInstrumentKey")
-        or item.get("underlyingInstrument_key")
     )
-    if sym and key and str(key).startswith("NSE_FO"):
+
+    if not sym or not key:
+        continue
+
+    if isinstance(key, str) and key.startswith("NSE_FO"):
         SYMBOL_MAP[sym] = key
+
+# ============================================================
+# SYSTEM CHECK (VISIBLE)
+# ============================================================
+st.sidebar.write("🧪 System Check")
+st.sidebar.write("Master records:", len(master_data))
+st.sidebar.write("Symbols loaded:", len(SYMBOL_MAP))
 
 if not SYMBOL_MAP:
     st.error("❌ No symbols loaded from master file")
@@ -162,11 +174,14 @@ def get_expiries(instrument_key):
     )
     if r.status_code != 200:
         return []
-    return sorted({
-        ts_to_ymd(i.get("expiry"))
-        for i in r.json().get("data", [])
-        if ts_to_ymd(i.get("expiry"))
-    })
+
+    expiries = set()
+    for i in r.json().get("data", []):
+        e = ts_to_ymd(i.get("expiry"))
+        if e:
+            expiries.add(e)
+
+    return sorted(expiries)
 
 def get_option_chain(instrument_key, expiry):
     r = requests.get(
@@ -192,18 +207,15 @@ def get_option_chain(instrument_key, expiry):
             "CE_prev_OI": safe_get(ce, "market_data", "prev_oi"),
             "CE_IV": safe_get(ce, "option_greeks", "iv"),
             "CE_Delta": safe_get(ce, "option_greeks", "delta"),
-            "CE_Theta": safe_get(ce, "option_greeks", "theta"),
 
             "PE_LTP": safe_get(pe, "market_data", "ltp"),
             "PE_OI": safe_get(pe, "market_data", "oi"),
             "PE_prev_OI": safe_get(pe, "market_data", "prev_oi"),
             "PE_IV": safe_get(pe, "option_greeks", "iv"),
             "PE_Delta": safe_get(pe, "option_greeks", "delta"),
-            "PE_Theta": safe_get(pe, "option_greeks", "theta"),
         })
 
-    df = pd.DataFrame(rows).fillna(0)
-    return df
+    return pd.DataFrame(rows).fillna(0)
 
 # ============================================================
 # UI
@@ -218,7 +230,7 @@ expiry = st.selectbox("Select Expiry", expiries)
 
 df = get_option_chain(instrument_key, expiry)
 if df.empty:
-    st.error("Option chain empty")
+    st.error("❌ Option chain empty")
     st.stop()
 
 spot = float(df["Spot"].iloc[0])
