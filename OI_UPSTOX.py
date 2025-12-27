@@ -136,10 +136,15 @@ except Exception as e:
     st.error(f"Error loading master file: {e}")
     st.stop()
 
-unique_underlyings = sorted({ item.get("underlying_symbol") for item in master_data if item.get("underlying_symbol") })
+unique_underlyings = sorted({
+    item.get("underlying_symbol")
+    for item in master_data
+    if item.get("underlying_symbol")
+})
+
 SYMBOL_MAP = {}
 
-for item in master:
+for item in master_data:
     sym = item.get("underlying_symbol")
     uk = (
         item.get("underlying_key")
@@ -151,7 +156,8 @@ for item in master:
         continue
 
     if str(uk).startswith("NSE_FO"):
-        SYMBOL_MAP.setdefault(sym, uk)
+        SYMBOL_MAP[sym] = uk
+
 
 
 # -------------------- API CALLS --------------------
