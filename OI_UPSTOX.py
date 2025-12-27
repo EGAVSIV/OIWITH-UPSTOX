@@ -1,8 +1,4 @@
 # app.py — Display & UI improvements (formatting, OTM filter, combined premium, tagline)
-
-
-
-
 import streamlit as st
 import requests
 import pandas as pd
@@ -28,9 +24,6 @@ if not st.session_state.authenticated:
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
 
-
-
-
     if st.button("Login"):
         if u in USERS and hash_pwd(p) == USERS[u]:
             st.session_state.authenticated = True
@@ -41,7 +34,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # -------------------- CONFIG --------------------
-st.set_page_config(page_title="Upstox Option Chain Analysis", layout="wide",page_icon="🚦")
+st.set_page_config(page_title="Upstox Option Chain Analysis", layout="wide")
 
 # 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
 # =====================================================
@@ -129,8 +122,6 @@ def ts_to_ymd(v):
         return None
 
 # -------------------- LOAD MASTER --------------------
-
-
 @st.cache_data(show_spinner=False)
 def load_master_file(path="complete.json.gz"):
     with gzip.open(path, "rt", encoding="utf-8") as f:
@@ -146,64 +137,30 @@ except Exception as e:
     st.stop()
 
 unique_underlyings = sorted({ item.get("underlying_symbol") for item in master_data if item.get("underlying_symbol") })
-
-
-SYMBOL_MAP = {}
-
-
-for item in master:
-    sym = item.get("underlying_symbol")
-
-
-
-    uk = (
-        item.get("underlying_key")
-        or item.get("underlyingInstrumentKey")
-        or item.get("underlyingInstrument_key")
-    )
-
-    if not sym or not uk:
-        continue
-
-    if str(uk).startswith("NSE_FO"):
-        SYMBOL_MAP.setdefault(sym, uk)
-
-
-
-
-
-
-
-
-
-
-
+symbol_map = {}
+underlying_meta = {}
+for sym in unique_underlyings:
+    for item in master_data:
+        if item.get("underlying_symbol") != sym:
+            continue
+        uk = item.get("underlying_key") or item.get("underlyingInstrumentKey") or item.get("underlyingInstrument_key")
+        if uk:
+            symbol_map[sym] = uk
+            underlying_meta[sym] = item
+            break
+if not symbol_map:
+    st.error("No underlyings found in master file.")
+    st.stop()
 
 # -------------------- API CALLS --------------------
 def get_expiries(instrument_key: str) -> list:
     url = f"{BASE_URL}/option/contract"
     params = {"instrument_key": instrument_key}
-
-
-
-
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=10)
     except Exception as e:
         st.error(f"Network error fetching expiries: {e}")
         return []
-
-
-
-
-
-
-
-
-
-
-
-
     if r.status_code != 200:
         st.warning(f"Upstox returned status {r.status_code} for expiries.")
         return []
@@ -211,7 +168,6 @@ def get_expiries(instrument_key: str) -> list:
     data = payload.get("data") or []
     if not data:
         return []
-
     expiries = set()
     for item in data:
         raw = item.get("expiry") or item.get("expiryDate") or item.get("expiry_date")
@@ -228,8 +184,6 @@ def get_option_chain(instrument_key: str, expiry: str) -> pd.DataFrame:
     except Exception as e:
         st.error(f"Network error fetching option chain: {e}")
         return pd.DataFrame()
-
-
     if r.status_code != 200:
         st.warning(f"Upstox returned status {r.status_code} for option chain.")
         return pd.DataFrame()
@@ -237,12 +191,10 @@ def get_option_chain(instrument_key: str, expiry: str) -> pd.DataFrame:
     data = payload.get("data") or []
     if not data:
         return pd.DataFrame()
-
     rows = []
     for row in data:
         ce = row.get("call_options") or {}
         pe = row.get("put_options") or {}
-
         rows.append({
             "Strike": safe_get(row, "strike_price", default=0),
             "Spot": safe_get(row, "underlying_spot_price", default=0),
@@ -260,52 +212,20 @@ def get_option_chain(instrument_key: str, expiry: str) -> pd.DataFrame:
             "PE_Delta": safe_get(pe, "option_greeks", "delta", default=0),
             "PE_Theta": safe_get(pe, "option_greeks", "theta", default=0),
         })
-
     df = pd.DataFrame(rows)
-
-
-
     for c in df.columns:
         if c != "Strike":
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-
-
-
-
-
-
-
-
-
-
-
-
     return df
 
 # -------------------- UI START --------------------
 st.title("📈 Upstox Option Chain Analysis — Display & Suggestions")
 st.markdown("Small UI settings — tweak filters and thresholds below:")
 
-
-
-
 # SYMBOL / EXPIRY
 symbol = st.selectbox("Select Symbol", sorted(symbol_map.keys()))
 instrument_key = symbol_map[symbol]
 meta = underlying_meta.get(symbol, {})
-
-
-
-
-
-
-
-
-
-
-
-
 
 expiries = get_expiries(instrument_key)
 if not expiries:
@@ -343,8 +263,6 @@ st.markdown(f"**Underlying Close / Spot:** `{spot_price:.2f}`")
 # compute IV change (pct) and OI change % (curr-prev)/prev*100 (negative = reduction)
 df["CE_IV_change"] = df["CE_IV"].pct_change().fillna(0) * 100
 df["PE_IV_change"] = df["PE_IV"].pct_change().fillna(0) * 100
-
-
 
 def oi_change_pct(curr, prev):
     try:
