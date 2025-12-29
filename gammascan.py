@@ -157,23 +157,32 @@ def gamma_engine(df, symbol, expiry):
 # ============================================================
 def gamma_trade_decision(df):
     row = df.iloc[0]
-    spot = row.Strike - row.OTM_Dist if row.Strike > row.OTM_Dist else row.Strike
 
+    # ---- HARD AVOID RULES ----
     if "Stop-Hunt" in row.Alert:
         return None, "Stop-hunt zone"
     if "FakeBreak" in row.Alert:
         return None, "Fake breakout (gamma collapse)"
+
+    # ---- DISTANCE FILTER ----
+    spot = row.Strike - row.OTM_Dist if row.Strike > row.OTM_Dist else row.Strike
     if row.OTM_Dist > spot * 0.01:
         return None, "Strike too far from spot"
 
-    action = "BUY CE" if row.Side == "CALL" else "BUY PE"
+    # ---- DIRECTION ----
+    option_type = "CE" if row.Side == "CALL" else "PE"
+    action = f"BUY {option_type}"
 
+    # ---- OPTION DISPLAY NAME ----
+    option_name = f"{row.Symbol} {int(row.Strike)} {option_type}"
+
+    # ---- CONFIDENCE & REASON ----
     if "BuyerDom" in row.Alert:
         confidence = "HIGH"
         reason = f"{row.Side} gamma dominant with buyer control"
     elif "GammaFlip" in row.Alert:
         confidence = "MEDIUM"
-        reason = f"{row.Side} gamma dominant, possible reversal"
+        reason = f"{row.Side} gamma dominant, possible reversal (gamma flip)"
     else:
         confidence = "MEDIUM"
         reason = f"{row.Side} gamma dominant near spot"
@@ -181,10 +190,13 @@ def gamma_trade_decision(df):
     return {
         "Symbol": row.Symbol,
         "Strike": int(row.Strike),
+        "OptionType": option_type,
+        "OptionName": option_name,
         "Action": action,
         "Confidence": confidence,
         "Reason": reason
     }, None
+
 
 # ============================================================
 # RUN SCAN
@@ -219,22 +231,26 @@ if st.button("🚀 Run Gamma Scan"):
     decision, reason = gamma_trade_decision(big)
 
     st.markdown("## 🎯 Gamma Trade Recommendation")
+    decision, reject_reason = gamma_trade_decision(big)
 
     if decision:
-        st.success("✅ Trade Found")
-
-        c1, c2 = st.columns(2)
-        with c1:
+        st.success("✅ Clear Trade Identified")
+        col1, col2 = st.columns(2)
+        with col1:
             st.metric("SYMBOL", decision["Symbol"])
-            st.metric("STRIKE", decision["Strike"])
+            st.metric("OPTION", decision["OptionName"])
             st.metric("ACTION", decision["Action"])
-        with c2:
+
+        with col2:
+            st.metric("STRIKE", decision["Strike"])
             st.metric("CONFIDENCE", decision["Confidence"])
 
         st.info(f"🧠 **Reason:** {decision['Reason']}")
+
     else:
         st.error("❌ NO TRADE")
-        st.warning(reason)
+        st.warning(f"Reason: {reject_reason}")
+
 
     st.divider()
     st.subheader("📊 Top 20 Gamma Strikes")
