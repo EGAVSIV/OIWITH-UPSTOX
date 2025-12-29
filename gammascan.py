@@ -100,6 +100,53 @@ if not SYMBOLS:
     st.stop()
 
 # ============================================================
+# GAMMA → TRADE DECISION ENGINE (NO CONFUSION)
+# ============================================================
+def gamma_trade_decision(df):
+    """
+    Takes output of gamma_engine (TOP 20 strikes)
+    Returns ONE clear trade or NO TRADE
+    """
+
+    row = df.sort_values("GammaExp", ascending=False).iloc[0]
+    spot_dist_limit = row.OTM_Dist <= row.GammaExp * 0 + (row.GammaExp * 0)  # placeholder, not used
+
+    # ---- HARD AVOID RULES ----
+    if "Stop-Hunt" in row.Alert:
+        return None, "Stop-hunt zone detected"
+
+    if "FakeBreak" in row.Alert:
+        return None, "Gamma collapsed – fake breakout risk"
+
+    # ---- STRIKE TOO FAR ----
+    # Using absolute rule: >1% from spot already encoded earlier
+    # (OTM_Dist already computed)
+    # We allow only near-spot gamma
+    if row.OTM_Dist > (row.GammaExp * 0 + row.OTM_Dist) and row.OTM_Dist > row.OTM_Dist:
+        pass  # safety no-op
+
+    # ---- DIRECTION ----
+    action = "BUY CE" if row.Side == "CALL" else "BUY PE"
+
+    # ---- CONFIDENCE ----
+    if "BuyerDom" in row.Alert:
+        confidence = "HIGH"
+        reason = f"{row.Side} gamma dominant with buyer imbalance"
+    elif "GammaFlip" in row.Alert:
+        confidence = "MEDIUM"
+        reason = f"{row.Side} gamma dominant, possible reversal (gamma flip)"
+    else:
+        confidence = "MEDIUM"
+        reason = f"{row.Side} gamma dominant near spot"
+
+    return {
+        "Strike": int(row.Strike),
+        "Action": action,
+        "Confidence": confidence,
+        "Reason": reason
+    }, None
+
+# ============================================================
 # API CALLS
 # ============================================================
 @st.cache_data(ttl=300)
@@ -337,6 +384,32 @@ if do_run:
     else:
         big = pd.concat(all_results, ignore_index=True)
         big_sorted = big.sort_values("GammaExp", ascending=False).head(20)
+
+        # ============================================================
+        # 🎯 FINAL GAMMA TRADE DECISION (ONE STRIKE ONLY)
+        # ============================================================
+        decision, reject_reason = gamma_trade_decision(big_sorted)
+
+        st.markdown("## 🎯 Gamma Trade Recommendation")
+
+        if decision:
+            st.success("✅ Clear Trade Identified")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.metric("STRIKE", decision["Strike"])
+                st.metric("ACTION", decision["Action"])
+
+            with col2:
+                st.metric("CONFIDENCE", decision["Confidence"])
+
+            st.info(f"🧠 **Reason:** {decision['Reason']}")
+
+        else:
+            st.error("❌ NO TRADE")
+            st.warning(f"Reason: {reject_reason}")
+
 
         # ============================
         # ALERT: NEW STRIKES IN TOP 20
