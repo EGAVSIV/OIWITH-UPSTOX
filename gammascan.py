@@ -1,9 +1,9 @@
 # ============================================================
-# GLOBAL GAMMA EXPANSION BUYER SCANNER (AUTO + MULTI DECISION)
+# GLOBAL GAMMA EXPANSION BUYER SCANNER (AUTO | CLEAN | FINAL)
 # ============================================================
 
 import streamlit as st
-import requests, gzip, json, time, os
+import requests, gzip, json, time
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -12,7 +12,7 @@ from datetime import datetime
 # CONFIG
 # ============================================================
 BASE_URL = "https://api.upstox.com/v2"
-REFRESH_SEC = 300  # 3 minutes
+REFRESH_SEC = 180  # 3 minutes
 
 st.set_page_config(
     page_title="Global Gamma Expansion Scanner",
@@ -21,7 +21,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Global Gamma Expansion & Buyer Dominance Scanner")
-st.caption("Top-20 Gamma strikes → Clear CE / PE recommendation")
+st.caption("One strike per stock • One side only • Top-20 only")
 
 # ============================================================
 # SESSION STATE
@@ -35,8 +35,8 @@ if "last_run" not in st.session_state:
 if "seen_strikes" not in st.session_state:
     st.session_state.seen_strikes = set()
 
-if "strike_first_seen" not in st.session_state:
-    st.session_state.strike_first_seen = {}
+if "first_seen" not in st.session_state:
+    st.session_state.first_seen = {}
 
 # ============================================================
 # TOKEN
@@ -57,7 +57,7 @@ HEADERS = {
 }
 
 # ============================================================
-# LOAD MASTER
+# LOAD MASTER (complete.json.gz)
 # ============================================================
 @st.cache_data
 def load_symbol_map():
@@ -92,12 +92,16 @@ def get_expiries(inst):
     )
     if r.status_code != 200:
         return []
-    return sorted({pd.to_datetime(x["expiry"]).strftime("%Y-%m-%d") for x in r.json()["data"]})
+    return sorted({
+        pd.to_datetime(x["expiry"]).strftime("%Y-%m-%d")
+        for x in r.json().get("data", [])
+    })
 
 def pick_nearest_expiry(exps):
     today = pd.Timestamp.today().normalize()
     future = [pd.to_datetime(x) for x in exps if pd.to_datetime(x) >= today]
-    return (min(future) if future else min(pd.to_datetime(x) for x in exps)).strftime("%Y-%m-%d")
+    chosen = min(future) if future else min(pd.to_datetime(x) for x in exps)
+    return chosen.strftime("%Y-%m-%d")
 
 def get_option_chain(inst, expiry):
     r = requests.get(
@@ -110,7 +114,7 @@ def get_option_chain(inst, expiry):
         return pd.DataFrame()
 
     rows = []
-    for x in r.json()["data"]:
+    for x in r.json().get("data", []):
         ce, pe = x.get("call_options", {}), x.get("put_options", {})
         rows.append({
             "Strike": x["strike_price"],
@@ -149,31 +153,36 @@ def gamma_engine(df, symbol, expiry):
     df["Symbol"] = symbol
     df["Expiry"] = expiry
 
-    return df.sort_values("GammaExp", ascending=False).head(20)
+    return df.sort_values("GammaExp", ascending=False)
 
 # ============================================================
-# TRADE DECISION (FOR EACH STRIKE)
+# 🎯 PICK ONE STRIKE PER SYMBOL (CORE FIX)
 # ============================================================
-def make_decision(row):
-    if "Stop-Hunt" in row.Alert or "FakeBreak" in row.Alert:
+def pick_best_strike(df):
+    # Remove bad signals
+    df = df[
+        (~df.Alert.str.contains("FakeBreak", na=False)) &
+        (~df.Alert.str.contains("Stop-Hunt", na=False))
+    ]
+
+    if df.empty:
         return None
 
-    option_type = "CE" if row.Side == "CALL" else "PE"
+    # Decide SIDE first
+    call_power = df[df.Side == "CALL"].GammaExp.sum()
+    put_power = df[df.Side == "PUT"].GammaExp.sum()
 
-    confidence = "HIGH" if "BuyerDom" in row.Alert else "MEDIUM"
+    side = "CALL" if call_power > put_power else "PUT"
+    df = df[df.Side == side]
 
-    reason = (
-        "CALL gamma dominant" if row.Side == "CALL"
-        else "PUT gamma dominant"
-    )
+    if df.empty:
+        return None
 
-    return {
-        "Symbol": row.Symbol,
-        "Option": f"{row.Symbol} {int(row.Strike)} {option_type}",
-        "Action": f"BUY {option_type}",
-        "Confidence": confidence,
-        "Reason": reason
-    }
+    # ATM / ITM-1 / OTM-1
+    df = df.sort_values("OTM_Dist").head(3)
+
+    # Strongest gamma
+    return df.sort_values("GammaExp", ascending=False).iloc[0]
 
 # ============================================================
 # UI CONTROLS
@@ -189,18 +198,14 @@ with c2:
         st.session_state.auto_scan = False
 
 # ============================================================
-# AUTO SCAN LOGIC
+# AUTO SCAN
 # ============================================================
 now = time.time()
-run_now = False
-
-if st.session_state.auto_scan and (now - st.session_state.last_run > REFRESH_SEC):
-    run_now = True
+run_now = st.session_state.auto_scan and (now - st.session_state.last_run > REFRESH_SEC)
 
 if run_now:
     st.session_state.last_run = now
-
-    suggestions = []
+    output = []
 
     for sym in SYMBOLS:
         inst = SYMBOL_MAP[sym]
@@ -214,27 +219,43 @@ if run_now:
             continue
 
         gamma_df = gamma_engine(chain, sym, expiry)
+        best = pick_best_strike(gamma_df)
 
-        for _, row in gamma_df.iterrows():
-            key = (row.Symbol, row.Expiry, row.Strike, row.Side)
+        if best is None:
+            continue
 
-            decision = make_decision(row)
-            if not decision:
-                continue
+        option_type = "CE" if best.Side == "CALL" else "PE"
+        key = (best.Symbol, best.Expiry, best.Strike, best.Side)
 
-            if key not in st.session_state.seen_strikes:
-                st.session_state.seen_strikes.add(key)
-                st.session_state.strike_first_seen[key] = datetime.now().strftime("%d %b %H:%M")
+        if key not in st.session_state.seen_strikes:
+            st.session_state.seen_strikes.add(key)
+            st.session_state.first_seen[key] = datetime.now().strftime("%d %b %H:%M")
 
-            decision["First Seen"] = st.session_state.strike_first_seen[key]
-            suggestions.append(decision)
+        output.append({
+            "Symbol": best.Symbol,
+            "Option": f"{best.Symbol} {int(best.Strike)} {option_type}",
+            "Action": f"BUY {option_type}",
+            "Confidence": "HIGH" if "BuyerDom" in best.Alert else "MEDIUM",
+            "Reason": f"{best.Side} gamma dominant",
+            "First Seen": st.session_state.first_seen[key],
+            "GammaExp": round(best.GammaExp, 2)
+        })
 
-    if suggestions:
-        df_out = pd.DataFrame(suggestions)
-        st.success("🎯 Gamma Trade Suggestions (Top-20)")
-        st.dataframe(df_out, use_container_width=True)
+    if output:
+        df_out = (
+            pd.DataFrame(output)
+            .sort_values("GammaExp", ascending=False)
+            .drop_duplicates("Symbol")
+            .head(20)
+        )
+
+        st.success("🎯 TOP-20 GAMMA TRADE SETUPS")
+        st.dataframe(
+            df_out.drop(columns="GammaExp"),
+            use_container_width=True
+        )
     else:
-        st.info("No new gamma-qualified strikes found")
+        st.info("No new qualifying gamma setups")
 
 # ============================================================
 # FOOTER
