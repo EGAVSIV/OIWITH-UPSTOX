@@ -12,7 +12,7 @@ from datetime import datetime
 # CONFIG
 # ============================================================
 BASE_URL = "https://api.upstox.com/v2"
-REFRESH_SEC = 180  # 3 minutes
+REFRESH_SEC = 300  # 3 minutes
 
 st.set_page_config(
     page_title="Global Gamma Expansion Scanner",
