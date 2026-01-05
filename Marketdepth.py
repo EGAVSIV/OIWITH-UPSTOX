@@ -1,40 +1,35 @@
 # ============================================================
-# GLOBAL GAMMA EXPANSION & BUYER DOMINANCE SCANNER
+# FUTURES MARKET DEPTH SCANNER (DERIVED SYMBOL KEYS)
 # ============================================================
 
 import streamlit as st
 import requests, gzip, json, time, os
 import pandas as pd
-import numpy as np
 
-# ============================================================
-# STREAMLIT CONFIG
-# ============================================================
+
 st.set_page_config(
-    page_title="Global Gamma Expansion Scanner",
-    page_icon="⚡",
+    page_title="Futures Market Depth Scanner",
+    page_icon="📊",
     layout="wide"
 )
 
-st.title("⚡ Global Gamma Expansion & Buyer Dominance Scanner")
-st.caption("Scans ALL underlyings → picks top 20 fastest premium movers based on Gamma Expansion")
+st.title("📊 Futures Market Depth Scanner (REST Depth Snapshot)")
+st.caption("Uses market-quote/quotes with NSE_FO:SYMBOLFUT keys and depth + total bid/ask filters.")
 
 BASE_URL = "https://api.upstox.com/v2"
 
 # ============================================================
-# SESSION STATE INIT (AUTO REFRESH & PREV TOP 20)
+# SESSION STATE
 # ============================================================
 if "auto_refresh" not in st.session_state:
     st.session_state["auto_refresh"] = False
-
 if "last_run" not in st.session_state:
     st.session_state["last_run"] = 0.0
-
-if "prev_top20" not in st.session_state:
-    st.session_state["prev_top20"] = pd.DataFrame()
+if "prev_top20_md" not in st.session_state:
+    st.session_state["prev_top20_md"] = pd.DataFrame()
 
 # ============================================================
-# LOAD ACCESS TOKEN
+# TOKEN
 # ============================================================
 def load_token():
     try:
@@ -54,238 +49,173 @@ HEADERS = {
 }
 
 # ============================================================
-# LOAD MASTER → SYMBOL → UNDERLYING_KEY MAP
+# FUTURES MAP FROM complete.json.gz
 # ============================================================
-@st.cache_data(show_spinner=False)
-def load_symbol_map():
+MONTHS = {
+    "JAN": "JAN", "FEB": "FEB", "MAR": "MAR", "APR": "APR",
+    "MAY": "MAY", "JUN": "JUN", "JUL": "JUL", "AUG": "AUG",
+    "SEP": "SEP", "OCT": "OCT", "NOV": "NOV", "DEC": "DEC"
+}
+
+def build_symbol_from_trading(under_sym, trading_symbol):
     """
-    Build underlying_symbol → underlying_key (NSE_EQ|.. or NSE_INDEX|..)
-    using NSE_FO rows from complete.json.gz.[web:4][web:18]
+    Convert 'EXIDEIND FUT 24 FEB 26' → 'EXIDEIND26FEBFUT' as seen in your API JSON.[web:92]
+    Pattern in your data:
+      <UNDER> FUT DD MON YY  -> UNDER + DD + MON + FUT
+    """
+    parts = trading_symbol.split()
+    # Expect something like [EXIDEIND, FUT, 24, FEB, 26]
+    if len(parts) < 5:
+        return None
+
+    # Try to find numeric day and 3-letter month
+    day = None
+    mon = None
+    for p in parts:
+        if p.isdigit() and len(p) <= 2:
+            day = p.zfill(2)  # 24 -> '24'
+        elif p.isalpha() and len(p) == 3 and p.upper() in MONTHS:
+            mon = p.upper()
+
+    if not day or not mon:
+        return None
+
+    return f"{under_sym}{day}{mon}FUT"
+
+@st.cache_data(show_spinner=False)
+def load_fut_map():
+    """
+    Build: underlying_symbol → market-quote key 'NSE_FO:SYMBOLFUT' where
+    SYMBOLFUT is derived from trading_symbol pattern.[web:4][web:92]
     """
     if not os.path.isfile("complete.json.gz"):
-        st.error("❌ complete.json.gz not found in current directory")
+        st.error("❌ complete.json.gz not found")
         st.stop()
 
-    try:
-        with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
-            master = json.load(f)
-    except Exception as e:
-        st.error(f"❌ Error reading complete.json.gz: {e}")
-        st.stop()
+    with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
+        master = json.load(f)
 
-    if not isinstance(master, list) or len(master) == 0:
-        st.error("❌ complete.json.gz has no records or invalid structure")
-        st.stop()
-
-    smap = {}
-
+    fut_map = {}
     for item in master:
         if item.get("segment") != "NSE_FO":
             continue
+        if item.get("instrument_type") != "FUT":
+            continue
 
-        underlying_sym = item.get("underlying_symbol")
-        underlying_key = item.get("underlying_key")
+        under_sym = item.get("underlying_symbol") or item.get("asset_symbol")
+        tsym = item.get("trading_symbol")
 
-        if (
-            underlying_sym
-            and underlying_key
-            and (underlying_key.startswith("NSE_EQ|") or underlying_key.startswith("NSE_INDEX|"))
-        ):
-            if underlying_sym not in smap:
-                smap[underlying_sym] = underlying_key
+        if not under_sym or not tsym:
+            continue
 
-    return dict(sorted(smap.items()))
+        symbol_key = build_symbol_from_trading(under_sym, tsym)
+        if not symbol_key:
+            continue
 
-SYMBOL_MAP = load_symbol_map()
-SYMBOLS = list(SYMBOL_MAP.keys())
+        mk_key = f"NSE_FO:{symbol_key}"
 
-st.caption(f"🧪 System Check — Underlyings loaded: {len(SYMBOLS)}")
+        if under_sym not in fut_map:
+            fut_map[under_sym] = mk_key
 
-if not SYMBOLS:
-    st.error("❌ No underlyings loaded from complete.json.gz")
+    return dict(sorted(fut_map.items()))
+
+
+FUT_MAP = load_fut_map()
+FUT_SYMBOLS = list(FUT_MAP.keys())
+
+st.caption(f"🧪 System Check — Futures (symbol-based) loaded: {len(FUT_SYMBOLS)}")
+if not FUT_SYMBOLS:
+    st.error("❌ No futures symbol keys built from complete.json.gz (check trading_symbol pattern)")
     st.stop()
 
+
 # ============================================================
-# API CALLS (EXPIRIES & OPTION CHAIN)
+# FULL MARKET QUOTE (DEPTH)
 # ============================================================
-@st.cache_data(ttl=300)
-def get_expiries(underlying_inst):
+@st.cache_data(ttl=5)
+def get_full_quotes(instrument_keys):
     """
-    underlying_inst: underlying instrument_key like NSE_EQ|... or NSE_INDEX|Nifty 50.[web:6]
+    Calls market-quote/quotes with symbol-style keys like 'NSE_FO:EXIDEIND26FEBFUT'.[web:92]
     """
-    r = requests.get(
-        f"{BASE_URL}/option/contract",
+    if not instrument_keys:
+        return {}
+
+
+    resp = requests.get(
+        f"{BASE_URL}/market-quote/quotes",
         headers=HEADERS,
-        params={"instrument_key": underlying_inst},
+        params={"instrument_key": ",".join(instrument_keys), "mode": "full"},
         timeout=10
     )
 
     try:
-        j = r.json()
+        j = resp.json()
     except Exception:
-        return []
+        st.write("Raw response:", resp.text)
+        return {}
 
-    if r.status_code != 200:
-        return []
+    st.write("Full-quote status:", resp.status_code)
+    st.write("Sample keys in data:", list(j.get("data", {}).keys())[:5])
 
-    data = j.get("data", [])
-    if not data:
-        return []
+    if resp.status_code != 200:
+        st.error(j)
+        return {}
 
-    expiries = set()
-    for d in data:
-        try:
-            expiries.add(pd.to_datetime(d["expiry"]).strftime("%Y-%m-%d"))
-        except Exception:
-            pass
+    return j.get("data", {})
 
-    return sorted(expiries)
+def parse_one(sym, mk_key, rec):
+    depth = rec.get("depth", {}) or {}
+    buy_levels = depth.get("buy", []) or []
+    sell_levels = depth.get("sell", []) or []
 
-def pick_focus_expiry(expiry_list):
-    """
-    Pick nearest upcoming expiry (best for intraday/short-term gamma).[web:58]
-    """
-    if not expiry_list:
-        return None
-    today = pd.Timestamp("today").normalize()
-    exps = [pd.to_datetime(x) for x in expiry_list]
-    future = [e for e in exps if e >= today]
-    chosen = min(future) if future else min(exps)
-    return chosen.strftime("%Y-%m-%d")
 
-def get_option_chain(underlying_inst, expiry):
-    r = requests.get(
-        f"{BASE_URL}/option/chain",
-        headers=HEADERS,
-        params={"instrument_key": underlying_inst, "expiry_date": expiry},
-        timeout=10
-    )
+    last_price = rec.get("last_price") or rec.get("ltp") or 0.0
+    total_bid = sum(l.get("quantity", 0) for l in buy_levels)
+    total_ask = sum(l.get("quantity", 0) for l in sell_levels)
 
-    if r.status_code != 200:
-        return pd.DataFrame()
+    # Add aggregate totals as backup.[web:92]
+    total_bid = total_bid or rec.get("total_buy_quantity", 0)
+    total_ask = total_ask or rec.get("total_sell_quantity", 0)
 
-    try:
-        j = r.json()
-    except Exception:
-        return pd.DataFrame()
-
-    rows = []
-    for x in j.get("data", []):
-        ce = x.get("call_options") or {}
-        pe = x.get("put_options") or {}
-
-        rows.append({
-            "Strike": x.get("strike_price"),
-            "Spot": x.get("underlying_spot_price"),
-            "CE_LTP": ce.get("market_data", {}).get("ltp"),
-            "CE_OI": ce.get("market_data", {}).get("oi"),
-            "CE_Gamma": ce.get("option_greeks", {}).get("gamma"),
-            "PE_LTP": pe.get("market_data", {}).get("ltp"),
-            "PE_OI": pe.get("market_data", {}).get("oi"),
-            "PE_Gamma": pe.get("option_greeks", {}).get("gamma"),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    return df.apply(pd.to_numeric, errors="coerce").dropna()
+    return {
+        "Symbol": sym,
+        "MarketKey": mk_key,
+        "Fut_Price": float(last_price) if last_price is not None else 0.0,
+        "Total_Bid_Qty": int(total_bid or 0),
+        "Total_Ask_Qty": int(total_ask or 0),
+    }
 
 # ============================================================
-# GAMMA ANALYSIS ENGINE
+# UI CONTROLS
 # ============================================================
-def gamma_engine(df, symbol, expiry):
-    df = df.copy()
-
-    df["CE_GEX"] = df["CE_LTP"] * df["CE_Gamma"] * df["CE_OI"]
-    df["PE_GEX"] = df["PE_LTP"] * df["PE_Gamma"] * df["PE_OI"]
-
-    df["GammaExp"] = df[["CE_GEX", "PE_GEX"]].max(axis=1)
-    df["Side"] = np.where(df["CE_GEX"] > df["PE_GEX"], "CALL", "PUT")
-
-    spot = df["Spot"].iloc[0]
-    df["OTM_Dist"] = abs(df["Strike"] - spot)
-
-    df["GammaChange"] = df["GammaExp"].pct_change()
-    df["PrevSide"] = df["Side"].shift(1)
-
-    df["Alert"] = ""
-
-    # Stop-hunt zone
-    df.loc[
-        (df["OTM_Dist"] > spot * 0.01) &
-        (df["GammaExp"] > df["GammaExp"].quantile(0.85)),
-        "Alert"
-    ] += "🟣 Stop-Hunt "
-
-    # Buyer dominance
-    df.loc[
-        abs(df["CE_GEX"] - df["PE_GEX"]) > df["GammaExp"] * 0.25,
-        "Alert"
-    ] += "🔥 BuyerDom "
-
-    # Fake breakout
-    df.loc[df["GammaChange"] < -0.4, "Alert"] += "⚠ FakeBreak "
-
-    # Gamma flip
-    df.loc[df["Side"] != df["PrevSide"], "Alert"] += "🔄 GammaFlip "
-
-    df["Symbol"] = symbol
-    df["Expiry"] = expiry
-
-    return (
-        df.sort_values("GammaExp", ascending=False)
-        .head(20)
-        [["Symbol", "Expiry", "Strike", "Side", "GammaExp", "OTM_Dist", "Alert"]]
-    )
-
-# ============================================================
-# UI CONTROLS: EXPIRY SELECTION + AUTO REFRESH
-# ============================================================
-col_exp, col_sym, col_auto = st.columns([2, 2, 2])
-
-with col_sym:
+col1, col2, col3 = st.columns(3)
+with col1:
     max_symbols = st.slider(
-        "Max underlyings to scan",
+        "Max futures to scan",
         10,
-        len(SYMBOLS),
-        min(50, len(SYMBOLS))
+        len(FUT_SYMBOLS),
+        min(50, len(FUT_SYMBOLS))
     )
+with col2:
+    bid_filter = st.number_input("Min Total Bid Quantity", min_value=0, value=60)
+with col3:
+    ask_filter = st.number_input("Min Total Ask Quantity", min_value=0, value=60)
 
-with col_exp:
-    expiry_mode = st.radio(
-        "Expiry selection",
-        ["Nearest expiry", "Select expiry manually"],
-        index=0
-    )
-
-with col_auto:
-    if st.button("⟳ Toggle Auto-Refresh (2 min)"):
-        st.session_state["auto_refresh"] = not st.session_state["auto_refresh"]
+if st.button("⟳ Toggle Auto-Refresh (2 min)"):
+    st.session_state["auto_refresh"] = not st.session_state["auto_refresh"]
 
 st.caption(
     f"Auto-refresh is **{'ON' if st.session_state['auto_refresh'] else 'OFF'}** "
-    f"(interval: 2 minutes)."
+    f"(interval: 2 minutes, using REST depth snapshot)."
 )
 
-manual_expiry = None
-if expiry_mode == "Select expiry manually":
-    sample_underlying = SYMBOL_MAP[SYMBOLS[0]]
-    sample_exps = get_expiries(sample_underlying)
-    if sample_exps:
-        manual_expiry = st.selectbox("Select global expiry (applied to all symbols)", sample_exps)
-    else:
-        st.warning("No expiries found for sample underlying; using nearest expiry mode fallback.")
-        expiry_mode = "Nearest expiry"
-
-scan_button = st.button("🚀 Scan Gamma (All Symbols)")
+scan_button = st.button("🚀 Scan Futures Depth Snapshot")
 
 # ============================================================
-# AUTO REFRESH HANDLING (2 MIN)
+# AUTO REFRESH
 # ============================================================
 REFRESH_SEC = 120
 now_ts = time.time()
-
 auto_trigger = False
 if st.session_state["auto_refresh"] and (now_ts - st.session_state["last_run"] > REFRESH_SEC):
     auto_trigger = True
@@ -293,96 +223,75 @@ if st.session_state["auto_refresh"] and (now_ts - st.session_state["last_run"] >
 do_run = scan_button or auto_trigger
 
 # ============================================================
-# EXECUTION: GLOBAL SCAN WITH NEW-STRIKE ALERTS
+# EXECUTION
 # ============================================================
 if do_run:
     st.session_state["last_run"] = now_ts
 
-    all_results = []
-
-    scan_list = SYMBOLS[:max_symbols]
+    scan_list = FUT_SYMBOLS[:max_symbols]
+    mk_keys = [FUT_MAP[s] for s in scan_list]
 
     progress = st.progress(0.0)
     status = st.empty()
 
+    data = get_full_quotes(mk_keys)
+
+
+    rows = []
     for i, sym in enumerate(scan_list, start=1):
-        underlying_key = SYMBOL_MAP.get(sym)
-        if not underlying_key:
-            progress.progress(i / len(scan_list))
-            continue
+        mk_key = FUT_MAP[sym]
+        rec = data.get(mk_key, {})
 
-        exps = get_expiries(underlying_key)
-        if not exps:
-            progress.progress(i / len(scan_list))
-            status.text(f"Skipping {sym} (no expiries)")
-            continue
-
-        if expiry_mode == "Nearest expiry":
-            expiry = pick_focus_expiry(exps)
-        else:
-            expiry = manual_expiry
-            if expiry not in exps:
-                progress.progress(i / len(scan_list))
-                status.text(f"Skipping {sym} (selected expiry not available)")
-                continue
-
-        if not expiry:
-            progress.progress(i / len(scan_list))
-            status.text(f"Skipping {sym} (no valid expiry)")
-            continue
-
-        df_chain = get_option_chain(underlying_key, expiry)
-        if df_chain.empty:
-            progress.progress(i / len(scan_list))
-            status.text(f"Skipping {sym} (empty chain)")
-            continue
-
-        try:
-            res = gamma_engine(df_chain, sym, expiry)
-            if not res.empty:
-                all_results.append(res)
-                status.text(f"Processed {sym} (expiry {expiry})")
-        except Exception as e:
-            status.text(f"Error on {sym}: {e}")
+        if rec:
+            rows.append(parse_one(sym, mk_key, rec))
 
         progress.progress(i / len(scan_list))
+        status.text(f"Processed depth for {sym}")
 
-    if not all_results:
-        st.error("No valid gamma data collected for any symbol.")
+    if not rows:
+        st.error("No full-quote depth data received for selected futures.")
     else:
-        big = pd.concat(all_results, ignore_index=True)
-        big_sorted = big.sort_values("GammaExp", ascending=False).head(20)
+        df = pd.DataFrame(rows)
 
-        # New‑strike alert
-        prev = st.session_state["prev_top20"]
-        new_rows = big_sorted.copy()
+        df_filt = df[
+            (df["Total_Bid_Qty"] > bid_filter) &
+            (df["Total_Ask_Qty"] > ask_filter)
+        ]
 
-        if not prev.empty:
-            prev_keys = set(zip(prev["Symbol"], prev["Expiry"], prev["Strike"], prev["Side"]))
-            new_keys = set(zip(new_rows["Symbol"], new_rows["Expiry"], new_rows["Strike"], new_rows["Side"]))
-            added_keys = new_keys - prev_keys
+        if df_filt.empty:
+            st.warning("No futures meet the bid/ask filters.")
+        else:
+            df_sorted = df_filt.sort_values(
+                ["Total_Bid_Qty", "Total_Ask_Qty"],
+                ascending=[False, False]
+            ).head(20)
 
-            if added_keys:
-                added_mask = [
-                    (row.Symbol, row.Expiry, row.Strike, row.Side) in added_keys
-                    for _, row in new_rows.iterrows()
-                ]
-                added_df = new_rows[added_mask]
-                st.error("🔔 New strikes entered TOP 20 list!")
-                st.table(added_df[["Symbol", "Expiry", "Strike", "Side", "GammaExp", "Alert"]])
+            prev = st.session_state["prev_top20_md"]
+            new_rows = df_sorted.copy()
 
-        st.session_state["prev_top20"] = big_sorted.copy()
+            if not prev.empty:
+                prev_keys = set(zip(prev["Symbol"], prev["MarketKey"]))
+                new_keys = set(zip(new_rows["Symbol"], new_rows["MarketKey"]))
+                added_keys = new_keys - prev_keys
 
-        st.success("Top 20 Gamma Expansion Strikes across ALL scanned symbols")
-        st.dataframe(big_sorted, use_container_width=True)
+                if added_keys:
+                    added_mask = [
+                        (row.Symbol, row.MarketKey) in added_keys
+                        for _, row in new_rows.iterrows()
+                    ]
+                    added_df = new_rows[added_mask]
+                    st.error("🔔 New futures entered TOP 20 (depth filter)!")
+                    st.table(
+                        added_df[["Symbol", "Fut_Price", "Total_Bid_Qty", "Total_Ask_Qty"]]
+                    )
 
-        alerts = big_sorted[big_sorted["Alert"] != ""]
-        if not alerts.empty:
-            st.warning("⚠ Active Gamma Alerts in Global Top 20")
-            st.table(alerts[["Symbol", "Expiry", "Strike", "Side", "Alert"]])
+            st.session_state["prev_top20_md"] = df_sorted.copy()
+
+            st.success("Top 20 Futures by Market Depth (Bid/Ask filters applied)")
+            st.dataframe(df_sorted, use_container_width=True)
 
 # ============================================================
 # FOOTER
 # ============================================================
 st.markdown("---")
-st.markdown("**Designed by: Gaurav Singh Yadav**  \nOptions | Gamma | Institutional Flow")
+st.markdown("**Designed by: Gaurav Singh Yadav**  \nFutures | Market Depth | Institutional Flow")
