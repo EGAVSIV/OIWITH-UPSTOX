@@ -1,20 +1,22 @@
 # ============================================================
-# FUTURES MARKET DEPTH SCANNER (DERIVED SYMBOL KEYS)
+# FUTURES MARKET DEPTH SCANNER (UPSTOX | FULL DEPTH | SAFE)
 # ============================================================
 
 import streamlit as st
 import requests, gzip, json, time, os
 import pandas as pd
 
-
+# ============================================================
+# STREAMLIT CONFIG
+# ============================================================
 st.set_page_config(
     page_title="Futures Market Depth Scanner",
     page_icon="📊",
     layout="wide"
 )
 
-st.title("📊 Futures Market Depth Scanner (REST Depth Snapshot)")
-st.caption("Uses market-quote/quotes with NSE_FO:SYMBOLFUT keys and depth + total bid/ask filters.")
+st.title("📊 Futures Market Depth Scanner (Upstox – FULL DEPTH)")
+st.caption("Uses valid numeric instrument_key → real bid/ask depth snapshot")
 
 BASE_URL = "https://api.upstox.com/v2"
 
@@ -22,73 +24,38 @@ BASE_URL = "https://api.upstox.com/v2"
 # SESSION STATE
 # ============================================================
 if "auto_refresh" not in st.session_state:
-    st.session_state["auto_refresh"] = False
+    st.session_state.auto_refresh = False
 if "last_run" not in st.session_state:
-    st.session_state["last_run"] = 0.0
-if "prev_top20_md" not in st.session_state:
-    st.session_state["prev_top20_md"] = pd.DataFrame()
+    st.session_state.last_run = 0.0
+if "prev_top20" not in st.session_state:
+    st.session_state.prev_top20 = pd.DataFrame()
 
 # ============================================================
-# TOKEN
+# LOAD TOKEN
 # ============================================================
 def load_token():
     try:
         with open("token.txt", "r") as f:
             token = f.read().strip()
             if not token:
-                raise ValueError("Empty token")
+                raise ValueError
             return token
-    except Exception:
+    except:
         st.error("❌ token.txt missing or empty")
         st.stop()
 
 HEADERS = {
-    "Accept": "application/json",
     "Authorization": f"Bearer {load_token()}",
+    "Accept": "application/json",
     "User-Agent": "Mozilla/5.0"
 }
 
 # ============================================================
-# FUTURES MAP FROM complete.json.gz
+# LOAD FUTURES MAP (USING REAL instrument_key)
 # ============================================================
-MONTHS = {
-    "JAN": "JAN", "FEB": "FEB", "MAR": "MAR", "APR": "APR",
-    "MAY": "MAY", "JUN": "JUN", "JUL": "JUL", "AUG": "AUG",
-    "SEP": "SEP", "OCT": "OCT", "NOV": "NOV", "DEC": "DEC"
-}
-
-def build_symbol_from_trading(under_sym, trading_symbol):
-    """
-    Convert 'EXIDEIND FUT 24 FEB 26' → 'EXIDEIND26FEBFUT' as seen in your API JSON.[web:92]
-    Pattern in your data:
-      <UNDER> FUT DD MON YY  -> UNDER + DD + MON + FUT
-    """
-    parts = trading_symbol.split()
-    # Expect something like [EXIDEIND, FUT, 24, FEB, 26]
-    if len(parts) < 5:
-        return None
-
-    # Try to find numeric day and 3-letter month
-    day = None
-    mon = None
-    for p in parts:
-        if p.isdigit() and len(p) <= 2:
-            day = p.zfill(2)  # 24 -> '24'
-        elif p.isalpha() and len(p) == 3 and p.upper() in MONTHS:
-            mon = p.upper()
-
-    if not day or not mon:
-        return None
-
-    return f"{under_sym}{day}{mon}FUT"
-
 @st.cache_data(show_spinner=False)
-def load_fut_map():
-    """
-    Build: underlying_symbol → market-quote key 'NSE_FO:SYMBOLFUT' where
-    SYMBOLFUT is derived from trading_symbol pattern.[web:4][web:92]
-    """
-    if not os.path.isfile("complete.json.gz"):
+def load_futures_map():
+    if not os.path.exists("complete.json.gz"):
         st.error("❌ complete.json.gz not found")
         st.stop()
 
@@ -102,196 +69,184 @@ def load_fut_map():
         if item.get("instrument_type") != "FUT":
             continue
 
-        under_sym = item.get("underlying_symbol") or item.get("asset_symbol")
-        tsym = item.get("trading_symbol")
+        underlying = item.get("underlying_symbol")
+        inst_key = item.get("instrument_key")
 
-        if not under_sym or not tsym:
+        if not underlying or not inst_key:
             continue
 
-        symbol_key = build_symbol_from_trading(under_sym, tsym)
-        if not symbol_key:
-            continue
-
-        mk_key = f"NSE_FO:{symbol_key}"
-
-        if under_sym not in fut_map:
-            fut_map[under_sym] = mk_key
+        # Keep nearest expiry only (first occurrence)
+        if underlying not in fut_map:
+            fut_map[underlying] = inst_key
 
     return dict(sorted(fut_map.items()))
 
-
-FUT_MAP = load_fut_map()
+FUT_MAP = load_futures_map()
 FUT_SYMBOLS = list(FUT_MAP.keys())
 
-st.caption(f"🧪 System Check — Futures (symbol-based) loaded: {len(FUT_SYMBOLS)}")
+st.caption(f"🧪 System Check — Futures loaded: {len(FUT_SYMBOLS)}")
+
 if not FUT_SYMBOLS:
-    st.error("❌ No futures symbol keys built from complete.json.gz (check trading_symbol pattern)")
+    st.error("❌ No futures found in complete.json.gz")
     st.stop()
 
-
 # ============================================================
-# FULL MARKET QUOTE (DEPTH)
+# MARKET QUOTE – FULL DEPTH
 # ============================================================
 @st.cache_data(ttl=5)
 def get_full_quotes(instrument_keys):
-    """
-    Calls market-quote/quotes with symbol-style keys like 'NSE_FO:EXIDEIND26FEBFUT'.[web:92]
-    """
     if not instrument_keys:
         return {}
 
-
-    resp = requests.get(
+    r = requests.get(
         f"{BASE_URL}/market-quote/quotes",
         headers=HEADERS,
-        params={"instrument_key": ",".join(instrument_keys), "mode": "full"},
+        params={
+            "instrument_key": ",".join(instrument_keys),
+            "mode": "full"
+        },
         timeout=10
     )
 
     try:
-        j = resp.json()
+        j = r.json()
     except Exception:
-        st.write("Raw response:", resp.text)
+        st.error("Invalid JSON response")
         return {}
 
-    st.write("Full-quote status:", resp.status_code)
-    st.write("Sample keys in data:", list(j.get("data", {}).keys())[:5])
-
-    if resp.status_code != 200:
+    if r.status_code != 200:
         st.error(j)
         return {}
 
     return j.get("data", {})
 
-def parse_one(sym, mk_key, rec):
+# ============================================================
+# PARSE DEPTH
+# ============================================================
+def parse_record(symbol, inst_key, rec):
     depth = rec.get("depth", {}) or {}
-    buy_levels = depth.get("buy", []) or []
-    sell_levels = depth.get("sell", []) or []
+    buy = depth.get("buy", []) or []
+    sell = depth.get("sell", []) or []
 
+    total_bid = sum(x.get("quantity", 0) for x in buy)
+    total_ask = sum(x.get("quantity", 0) for x in sell)
 
-    last_price = rec.get("last_price") or rec.get("ltp") or 0.0
-    total_bid = sum(l.get("quantity", 0) for l in buy_levels)
-    total_ask = sum(l.get("quantity", 0) for l in sell_levels)
-
-    # Add aggregate totals as backup.[web:92]
+    # fallback (some contracts)
     total_bid = total_bid or rec.get("total_buy_quantity", 0)
     total_ask = total_ask or rec.get("total_sell_quantity", 0)
 
     return {
-        "Symbol": sym,
-        "MarketKey": mk_key,
-        "Fut_Price": float(last_price) if last_price is not None else 0.0,
-        "Total_Bid_Qty": int(total_bid or 0),
-        "Total_Ask_Qty": int(total_ask or 0),
+        "Symbol": symbol,
+        "InstrumentKey": inst_key,
+        "Fut_Price": rec.get("last_price", 0.0),
+        "Total_Bid_Qty": int(total_bid),
+        "Total_Ask_Qty": int(total_ask),
+        "Bid_Ask_Delta": int(total_bid - total_ask)
     }
 
 # ============================================================
 # UI CONTROLS
 # ============================================================
-col1, col2, col3 = st.columns(3)
-with col1:
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
     max_symbols = st.slider(
         "Max futures to scan",
-        10,
-        len(FUT_SYMBOLS),
+        10, len(FUT_SYMBOLS),
         min(50, len(FUT_SYMBOLS))
     )
-with col2:
-    bid_filter = st.number_input("Min Total Bid Quantity", min_value=0, value=60)
-with col3:
-    ask_filter = st.number_input("Min Total Ask Quantity", min_value=0, value=60)
+with c2:
+    bid_filter = st.number_input("Min Total Bid Qty", value=100)
+with c3:
+    ask_filter = st.number_input("Min Total Ask Qty", value=100)
+with c4:
+    delta_filter = st.number_input("Min |Bid–Ask Delta|", value=0)
 
 if st.button("⟳ Toggle Auto-Refresh (2 min)"):
-    st.session_state["auto_refresh"] = not st.session_state["auto_refresh"]
+    st.session_state.auto_refresh = not st.session_state.auto_refresh
 
 st.caption(
-    f"Auto-refresh is **{'ON' if st.session_state['auto_refresh'] else 'OFF'}** "
-    f"(interval: 2 minutes, using REST depth snapshot)."
+    f"Auto-refresh: **{'ON' if st.session_state.auto_refresh else 'OFF'}**"
 )
 
-scan_button = st.button("🚀 Scan Futures Depth Snapshot")
+scan_btn = st.button("🚀 Scan Futures Depth")
 
 # ============================================================
 # AUTO REFRESH
 # ============================================================
 REFRESH_SEC = 120
-now_ts = time.time()
-auto_trigger = False
-if st.session_state["auto_refresh"] and (now_ts - st.session_state["last_run"] > REFRESH_SEC):
-    auto_trigger = True
-
-do_run = scan_button or auto_trigger
+now = time.time()
+auto_run = (
+    st.session_state.auto_refresh and
+    (now - st.session_state.last_run > REFRESH_SEC)
+)
 
 # ============================================================
 # EXECUTION
 # ============================================================
-if do_run:
-    st.session_state["last_run"] = now_ts
+if scan_btn or auto_run:
+    st.session_state.last_run = now
 
-    scan_list = FUT_SYMBOLS[:max_symbols]
-    mk_keys = [FUT_MAP[s] for s in scan_list]
+    scan_syms = FUT_SYMBOLS[:max_symbols]
+    inst_keys = [FUT_MAP[s] for s in scan_syms]
 
     progress = st.progress(0.0)
     status = st.empty()
 
-    data = get_full_quotes(mk_keys)
-
+    data = get_full_quotes(inst_keys)
 
     rows = []
-    for i, sym in enumerate(scan_list, start=1):
-        mk_key = FUT_MAP[sym]
-        rec = data.get(mk_key, {})
-
+    for i, sym in enumerate(scan_syms, start=1):
+        inst = FUT_MAP[sym]
+        rec = data.get(inst)
         if rec:
-            rows.append(parse_one(sym, mk_key, rec))
+            rows.append(parse_record(sym, inst, rec))
 
-        progress.progress(i / len(scan_list))
-        status.text(f"Processed depth for {sym}")
+        progress.progress(i / len(scan_syms))
+        status.text(f"Processing {sym}")
 
     if not rows:
-        st.error("No full-quote depth data received for selected futures.")
-    else:
-        df = pd.DataFrame(rows)
+        st.error("❌ No depth data received")
+        st.stop()
 
-        df_filt = df[
-            (df["Total_Bid_Qty"] > bid_filter) &
-            (df["Total_Ask_Qty"] > ask_filter)
-        ]
+    df = pd.DataFrame(rows)
 
-        if df_filt.empty:
-            st.warning("No futures meet the bid/ask filters.")
-        else:
-            df_sorted = df_filt.sort_values(
-                ["Total_Bid_Qty", "Total_Ask_Qty"],
-                ascending=[False, False]
-            ).head(20)
+    df_filt = df[
+        (df["Total_Bid_Qty"] >= bid_filter) &
+        (df["Total_Ask_Qty"] >= ask_filter) &
+        (df["Bid_Ask_Delta"].abs() >= delta_filter)
+    ]
 
-            prev = st.session_state["prev_top20_md"]
-            new_rows = df_sorted.copy()
+    if df_filt.empty:
+        st.warning("No futures match filters")
+        st.stop()
 
-            if not prev.empty:
-                prev_keys = set(zip(prev["Symbol"], prev["MarketKey"]))
-                new_keys = set(zip(new_rows["Symbol"], new_rows["MarketKey"]))
-                added_keys = new_keys - prev_keys
+    df_top = df_filt.sort_values(
+        ["Bid_Ask_Delta", "Total_Bid_Qty"],
+        ascending=[False, False]
+    ).head(20)
 
-                if added_keys:
-                    added_mask = [
-                        (row.Symbol, row.MarketKey) in added_keys
-                        for _, row in new_rows.iterrows()
-                    ]
-                    added_df = new_rows[added_mask]
-                    st.error("🔔 New futures entered TOP 20 (depth filter)!")
-                    st.table(
-                        added_df[["Symbol", "Fut_Price", "Total_Bid_Qty", "Total_Ask_Qty"]]
-                    )
+    prev = st.session_state.prev_top20
+    if not prev.empty:
+        old = set(prev["InstrumentKey"])
+        new = set(df_top["InstrumentKey"])
+        added = df_top[df_top["InstrumentKey"].isin(new - old)]
+        if not added.empty:
+            st.error("🔔 NEW Futures Entered TOP-20")
+            st.table(
+                added[["Symbol", "Fut_Price", "Total_Bid_Qty", "Total_Ask_Qty", "Bid_Ask_Delta"]]
+            )
 
-            st.session_state["prev_top20_md"] = df_sorted.copy()
+    st.session_state.prev_top20 = df_top.copy()
 
-            st.success("Top 20 Futures by Market Depth (Bid/Ask filters applied)")
-            st.dataframe(df_sorted, use_container_width=True)
+    st.success("✅ Top-20 Futures by Market Depth")
+    st.dataframe(df_top, use_container_width=True)
 
 # ============================================================
 # FOOTER
 # ============================================================
 st.markdown("---")
-st.markdown("**Designed by: Gaurav Singh Yadav**  \nFutures | Market Depth | Institutional Flow")
+st.markdown(
+    "**Designed by: Gaurav Singh Yadav**  \n"
+    "Upstox Futures | Market Depth | Institutional Order Flow"
+)
