@@ -1,275 +1,169 @@
-# ============================================================
-# FUTURES MARKET DEPTH SCANNER (UPSTOX – DEPTH SAFE FINAL)
-# ============================================================
-
+import requests, gzip, json, pandas as pd, time, os
 import streamlit as st
-import requests, gzip, json, time, os
-import pandas as pd
+from io import BytesIO
+from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
-# ============================================================
-# STREAMLIT CONFIG
-# ============================================================
-st.set_page_config(
-    page_title="Futures Market Depth Scanner",
-    page_icon="📊",
-    layout="wide"
-)
+# ================= CONFIG =================
+REFRESH_SEC = 3
+IMBALANCE_THRESHOLD = 80
 
-st.title("📊 Futures Market Depth Scanner (Upstox – REAL DEPTH)")
-st.caption("Robust | Handles missing depth | Uses numeric instrument_key only")
+BOT_TOKEN = "8268990134:AAGJJQrPzbi_3ROJWlDzF1sOl1RJLWP1t50"
+CHAT_IDS = ['5332984891', '-1002622207173']
 
-BASE_URL = "https://api.upstox.com/v2"
+# ================= PAGE =================
+st.set_page_config("Order Flow PRO", layout="wide")
+st.title("📊 Order Flow PRO Dashboard")
 
-# ============================================================
-# SESSION STATE
-# ============================================================
-if "auto_refresh" not in st.session_state:
-    st.session_state.auto_refresh = False
-if "last_run" not in st.session_state:
-    st.session_state.last_run = 0.0
-if "prev_top20" not in st.session_state:
-    st.session_state.prev_top20 = pd.DataFrame()
-
-# ============================================================
-# TOKEN LOADER
-# ============================================================
-def load_token():
-    try:
-        with open("token.txt", "r") as f:
-            token = f.read().strip()
-            if not token:
-                raise ValueError
-            return token
-    except:
-        st.error("❌ token.txt missing or empty")
-        st.stop()
+# ================= TOKEN =================
+with open("token.txt") as f:
+    ACCESS_TOKEN = f.read().strip()
 
 HEADERS = {
-    "Authorization": f"Bearer {load_token()}",
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0"
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Accept": "application/json"
 }
 
-# ============================================================
-# LOAD FUTURES MAP (REAL instrument_key)
-# ============================================================
-@st.cache_data(show_spinner=False)
-def load_futures_map():
-    if not os.path.exists("complete.json.gz"):
-        st.error("❌ complete.json.gz not found")
-        st.stop()
+QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
+HIST_URL = "https://api.upstox.com/v2/historical-candle/intraday"
 
-    with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
-        master = json.load(f)
+# ================= TELEGRAM =================
+def send_telegram(msg):
+    for cid in CHAT_IDS:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": cid, "text": msg},
+                timeout=5
+            )
+        except:
+            pass
 
-    fut_map = {}
-    for item in master:
-        if item.get("segment") != "NSE_FO":
-            continue
-        if item.get("instrument_type") != "FUT":
-            continue
+# ================= MASTER =================
+@st.cache_data
+def load_master():
+    url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+    r = requests.get(url)
+    with gzip.GzipFile(fileobj=BytesIO(r.content)) as f:
+        df = pd.DataFrame(json.load(f))
 
-        underlying = item.get("underlying_symbol")
-        inst_key = item.get("instrument_key")
+    df['expiry'] = pd.to_datetime(df['expiry'], unit='ms', errors='coerce')
+    df = df[df['instrument_type'] == 'FUT']
 
-        if not underlying or not inst_key:
-            continue
+    nearest = df.sort_values('expiry').groupby(
+        ['exchange', 'underlying_symbol']
+    ).first().reset_index()
 
-        # nearest expiry only (first occurrence)
-        if underlying not in fut_map:
-            fut_map[underlying] = inst_key
-
-    return dict(sorted(fut_map.items()))
-
-FUT_MAP = load_futures_map()
-FUT_SYMBOLS = list(FUT_MAP.keys())
-
-st.caption(f"🧪 System Check — Futures loaded: {len(FUT_SYMBOLS)}")
-
-if not FUT_SYMBOLS:
-    st.error("❌ No futures available")
-    st.stop()
-
-# ============================================================
-# MARKET QUOTE – FULL MODE
-# ============================================================
-@st.cache_data(ttl=5)
-def get_full_quotes(inst_keys):
-    if not inst_keys:
-        return {}
-
-    r = requests.get(
-        f"{BASE_URL}/market-quote/quotes",
-        headers=HEADERS,
-        params={
-            "instrument_key": ",".join(inst_keys),
-            "mode": "full"
-        },
-        timeout=10
-    )
-
-    try:
-        j = r.json()
-    except:
-        return {}
-
-    if r.status_code != 200:
-        st.error(j)
-        return {}
-
-    return j.get("data", {})
-
-# ============================================================
-# PARSE RECORD (DEPTH SAFE)
-# ============================================================
-def parse_record(symbol, inst_key, rec):
-    depth = rec.get("depth")
-
-    if depth:
-        buy = depth.get("buy", []) or []
-        sell = depth.get("sell", []) or []
-
-        total_bid = sum(x.get("quantity", 0) for x in buy)
-        total_ask = sum(x.get("quantity", 0) for x in sell)
-
-        total_bid = total_bid or rec.get("total_buy_quantity", 0)
-        total_ask = total_ask or rec.get("total_sell_quantity", 0)
-
-        depth_status = "AVAILABLE"
-    else:
-        total_bid = rec.get("total_buy_quantity", 0)
-        total_ask = rec.get("total_sell_quantity", 0)
-        depth_status = "NOT AVAILABLE"
-
-    return {
-        "Symbol": symbol,
-        "InstrumentKey": inst_key,
-        "Fut_Price": rec.get("last_price", 0.0),
-        "Total_Bid_Qty": int(total_bid or 0),
-        "Total_Ask_Qty": int(total_ask or 0),
-        "Bid_Ask_Delta": int((total_bid or 0) - (total_ask or 0)),
-        "Depth_Status": depth_status
+    symbol_info = {
+        r['instrument_key']: {
+            "symbol": r['trading_symbol'],
+            "exchange": r['exchange']
+        }
+        for _, r in nearest.iterrows()
     }
 
-# ============================================================
-# UI CONTROLS
-# ============================================================
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    max_symbols = st.slider(
-        "Max futures to scan",
-        10, len(FUT_SYMBOLS),
-        min(50, len(FUT_SYMBOLS))
+    return (
+        [k for k,v in symbol_info.items() if v['exchange']=="NSE"],
+        [k for k,v in symbol_info.items() if v['exchange']=="MCX"]
     )
 
-with c2:
-    bid_filter = st.number_input("Min Total Bid Qty", value=0)
+NSE_KEYS, MCX_KEYS = load_master()
 
-with c3:
-    ask_filter = st.number_input("Min Total Ask Qty", value=0)
+# ================= INDICATORS =================
+def calc_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / loss
+    return round((100 - (100 / (1 + rs))).iloc[-1], 1)
 
-with c4:
-    delta_filter = st.number_input("Min |Bid–Ask Delta|", value=0)
+def calc_macd(close):
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    return "Bullish" if ema12.iloc[-1] > ema26.iloc[-1] else "Bearish"
 
-if st.button("⟳ Toggle Auto-Refresh (2 min)"):
-    st.session_state.auto_refresh = not st.session_state.auto_refresh
+def fetch_indicators(ikey):
+    r = requests.get(HIST_URL, headers=HEADERS, params={"instrument_key": ikey})
+    candles = r.json().get("data", {}).get("candles", [])
+    if len(candles) < 30:
+        return "NA", "NA"
+    df = pd.DataFrame(candles, columns=["t","o","h","l","c","v"])
+    return calc_macd(df['c']), calc_rsi(df['c'])
 
-st.caption(
-    f"Auto-refresh: **{'ON' if st.session_state.auto_refresh else 'OFF'}**"
-)
+# ================= ALERT LOG =================
+if not os.path.exists("alerts.xlsx"):
+    pd.DataFrame(columns=[
+        "Time","Symbol","Exchange","Signal","Buy%","Sell%","MACD","RSI"
+    ]).to_excel("alerts.xlsx", index=False)
 
-scan_btn = st.button("🚀 Scan Futures Depth")
+def save_alert(row):
+    df = pd.read_excel("alerts.xlsx")
+    df.loc[len(df)] = row
+    df.to_excel("alerts.xlsx", index=False)
 
-# ============================================================
-# AUTO REFRESH LOGIC
-# ============================================================
-REFRESH_SEC = 120
-now = time.time()
-auto_run = (
-    st.session_state.auto_refresh and
-    (now - st.session_state.last_run > REFRESH_SEC)
-)
+# ================= STATE =================
+if "last_state" not in st.session_state:
+    st.session_state.last_state = {}
 
-# ============================================================
-# EXECUTION
-# ============================================================
-if scan_btn or auto_run:
-    st.session_state.last_run = now
-
-    scan_syms = FUT_SYMBOLS[:max_symbols]
-    inst_keys = [FUT_MAP[s] for s in scan_syms]
-
-    progress = st.progress(0.0)
-    status = st.empty()
-
-    data = get_full_quotes(inst_keys)
-
+# ================= DATA FETCH =================
+def fetch_orderflow(keys, exch):
+    r = requests.get(
+        QUOTE_URL,
+        headers=HEADERS,
+        params={"instrument_key": ",".join(keys)},
+        timeout=15
+    )
     rows = []
-    for i, sym in enumerate(scan_syms, start=1):
-        inst = FUT_MAP[sym]
-        rec = data.get(inst)
 
-        if rec:
-            rows.append(parse_record(sym, inst, rec))
+    for q in r.json().get("data", {}).values():
+        d = q.get("depth", {})
+        bq = sum(x['quantity'] for x in d.get("buy", []))
+        sq = sum(x['quantity'] for x in d.get("sell", []))
+        tot = bq + sq
+        if tot == 0:
+            continue
 
-        progress.progress(i / len(scan_syms))
-        status.text(f"Processing {sym}")
+        bp = round(bq*100/tot,1)
+        sp = round(sq*100/tot,1)
+        signal = "BUY" if bp > sp else "SELL"
 
-    if not rows:
-        st.warning("⚠️ No futures returned data in this scan window")
-        st.stop()
+        macd, rsi = fetch_indicators(q['instrument_token'])
 
-    df = pd.DataFrame(rows)
+        if max(bp,sp) >= IMBALANCE_THRESHOLD and \
+           st.session_state.last_state.get(q['symbol']) != signal:
 
-    st.info(
-        f"Depth Available: {(df['Depth_Status'] == 'AVAILABLE').sum()} | "
-        f"Depth Missing: {(df['Depth_Status'] == 'NOT AVAILABLE').sum()}"
-    )
+            st.toast(f"{q['symbol']} → {signal}", icon="🚨")
 
-    df_filt = df[
-        (df["Total_Bid_Qty"] >= bid_filter) &
-        (df["Total_Ask_Qty"] >= ask_filter) &
-        (df["Bid_Ask_Delta"].abs() >= delta_filter)
-    ]
-
-    if df_filt.empty:
-        st.warning("No futures match filter criteria")
-        st.stop()
-
-    df_top = df_filt.sort_values(
-        ["Bid_Ask_Delta", "Total_Bid_Qty"],
-        ascending=[False, False]
-    ).head(20)
-
-    prev = st.session_state.prev_top20
-    if not prev.empty:
-        old = set(prev["InstrumentKey"])
-        new = set(df_top["InstrumentKey"])
-        added = df_top[df_top["InstrumentKey"].isin(new - old)]
-        if not added.empty:
-            st.error("🔔 NEW Futures Entered TOP-20")
-            st.table(
-                added[[
-                    "Symbol",
-                    "Fut_Price",
-                    "Total_Bid_Qty",
-                    "Total_Ask_Qty",
-                    "Bid_Ask_Delta",
-                    "Depth_Status"
-                ]]
+            send_telegram(
+                f"{q['symbol']} {signal}\nBuy:{bp}% Sell:{sp}%\nMACD:{macd} RSI:{rsi}"
             )
 
-    st.session_state.prev_top20 = df_top.copy()
+            save_alert([
+                datetime.now(), q['symbol'], exch,
+                signal, bp, sp, macd, rsi
+            ])
 
-    st.success("✅ Top-20 Futures by Market Depth / Order Pressure")
-    st.dataframe(df_top, use_container_width=True)
+            st.session_state.last_state[q['symbol']] = signal
 
-# ============================================================
-# FOOTER
-# ============================================================
-st.markdown("---")
-st.markdown(
-    "**Designed by: Gaurav Singh Yadav**  \n"
-    "Upstox Futures | Market Depth | Institutional Order Flow"
-)
+        rows.append([
+            q['symbol'], bq, sq,
+            f"{bp}% 🟢" if signal=="BUY" else f"{sp}% 🔴",
+            macd, rsi
+        ])
+
+    return pd.DataFrame(
+        rows,
+        columns=["Symbol","BuyQty","SellQty","Pressure","MACD","RSI"]
+    )
+
+# ================= AUTO REFRESH =================
+st_autorefresh(interval=REFRESH_SEC*1000, key="refresh")
+
+# ================= UI =================
+tab1, tab2 = st.tabs(["📈 NSE FUTURES", "🛢 MCX FUTURES"])
+
+with tab1:
+    st.dataframe(fetch_orderflow(NSE_KEYS, "NSE"), use_container_width=True)
+
+with tab2:
+    st.dataframe(fetch_orderflow(MCX_KEYS, "MCX"), use_container_width=True)
