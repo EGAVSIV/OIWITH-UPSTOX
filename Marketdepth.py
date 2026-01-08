@@ -1,31 +1,36 @@
-import requests, gzip, json, pandas as pd, time, os
 import streamlit as st
+
+# 🔴 MUST BE FIRST STREAMLIT COMMAND
+st.set_page_config(
+    page_title="Order Flow Pressure PRO",
+    layout="wide"
+)
+
+import requests, gzip, json, pandas as pd, time, os, winsound
 from io import BytesIO
-from datetime import datetime
-from streamlit_autorefresh import st_autorefresh
+from datetime import datetime, timedelta
 
 # ================= CONFIG =================
-REFRESH_SEC = 3
+REFRESH_SEC = 30          # main scan
+LIVE_REFRESH_SEC = 3      # live depth
 IMBALANCE_THRESHOLD = 80
+ALERT_COOLDOWN_MIN = 10
+EXCEL_FILE = "orderflow_alerts.xlsx"
 
-BOT_TOKEN = "8268990134:AAGJJQrPzbi_3ROJWlDzF1sOl1RJLWP1t50"
-CHAT_IDS = ['5332984891', '-1002622207173']
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+CHAT_IDS = ["CHAT_ID"]
 
-# ================= PAGE =================
-st.set_page_config("Order Flow PRO", layout="wide")
-st.title("📊 Order Flow PRO Dashboard")
+COMMODITIES = {
+    "CRUDEOIL", "NATURALGAS", "GOLD", "SILVER",
+    "ALUMINIUM", "COPPER", "LEAD", "ZINC"
+}
 
 # ================= TOKEN =================
 with open("token.txt") as f:
     ACCESS_TOKEN = f.read().strip()
 
-HEADERS = {
-    "Authorization": f"Bearer {ACCESS_TOKEN}",
-    "Accept": "application/json"
-}
-
+HEADERS = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Accept": "application/json"}
 QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
-HIST_URL = "https://api.upstox.com/v2/historical-candle/intraday"
 
 # ================= TELEGRAM =================
 def send_telegram(msg):
@@ -33,15 +38,14 @@ def send_telegram(msg):
         try:
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": cid, "text": msg},
-                timeout=5
+                json={"chat_id": cid, "text": msg}, timeout=5
             )
         except:
             pass
 
-# ================= MASTER =================
+# ================= LOAD MASTER =================
 @st.cache_data
-def load_master():
+def load_symbols():
     url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
     r = requests.get(url)
     with gzip.GzipFile(fileobj=BytesIO(r.content)) as f:
@@ -54,116 +58,184 @@ def load_master():
         ['exchange', 'underlying_symbol']
     ).first().reset_index()
 
-    symbol_info = {
+    return {
         r['instrument_key']: {
             "symbol": r['trading_symbol'],
-            "exchange": r['exchange']
-        }
-        for _, r in nearest.iterrows()
+            "exchange": r['exchange'],
+            "underlying": r['underlying_symbol']
+        } for _, r in nearest.iterrows()
     }
 
-    return (
-        [k for k,v in symbol_info.items() if v['exchange']=="NSE"],
-        [k for k,v in symbol_info.items() if v['exchange']=="MCX"]
+SYMBOL_INFO = load_symbols()
+
+NSE_KEYS = [
+    k for k, v in SYMBOL_INFO.items()
+    if v["exchange"] == "NSE" and v["underlying"].upper() not in COMMODITIES
+]
+
+MCX_KEYS = [
+    k for k, v in SYMBOL_INFO.items()
+    if v["exchange"] == "MCX" and v["underlying"].upper() in COMMODITIES
+]
+
+# For stock-wise depth dropdown only (UI convenience)
+SYMBOL_KEY_MAP = {v["symbol"]: k for k, v in SYMBOL_INFO.items()}
+
+# ================= SESSION STATE INIT =================
+if "captured" not in st.session_state:
+    st.session_state.captured = pd.DataFrame(
+        columns=[
+            "EntryTime", "Exchange", "Symbol",
+            "InstrumentKey",        # ✅ IMPORTANT
+            "Signal", "Buy%", "Sell%",
+            "LiveBuy%", "LiveSell%"
+        ]
     )
 
-NSE_KEYS, MCX_KEYS = load_master()
+if "last_alert" not in st.session_state:
+    st.session_state.last_alert = {}
 
-# ================= INDICATORS =================
-def calc_rsi(close, period=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = -delta.clip(upper=0).rolling(period).mean()
-    rs = gain / loss
-    return round((100 - (100 / (1 + rs))).iloc[-1], 1)
+# ================= SESSION STATE MIGRATION (FIX KEYERROR) =================
+required_cols = [
+    "EntryTime", "Exchange", "Symbol",
+    "InstrumentKey",
+    "Signal", "Buy%", "Sell%",
+    "LiveBuy%", "LiveSell%"
+]
 
-def calc_macd(close):
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    return "Bullish" if ema12.iloc[-1] > ema26.iloc[-1] else "Bearish"
+for col in required_cols:
+    if col not in st.session_state.captured.columns:
+        st.session_state.captured[col] = None
 
-def fetch_indicators(ikey):
-    r = requests.get(HIST_URL, headers=HEADERS, params={"instrument_key": ikey})
-    candles = r.json().get("data", {}).get("candles", [])
-    if len(candles) < 30:
-        return "NA", "NA"
-    df = pd.DataFrame(candles, columns=["t","o","h","l","c","v"])
-    return calc_macd(df['c']), calc_rsi(df['c'])
+# ================= EXCEL INIT =================
+if not os.path.exists(EXCEL_FILE):
+    st.session_state.captured.to_excel(EXCEL_FILE, index=False)
 
-# ================= ALERT LOG =================
-if not os.path.exists("alerts.xlsx"):
-    pd.DataFrame(columns=[
-        "Time","Symbol","Exchange","Signal","Buy%","Sell%","MACD","RSI"
-    ]).to_excel("alerts.xlsx", index=False)
-
-def save_alert(row):
-    df = pd.read_excel("alerts.xlsx")
-    df.loc[len(df)] = row
-    df.to_excel("alerts.xlsx", index=False)
-
-# ================= STATE =================
-if "last_state" not in st.session_state:
-    st.session_state.last_state = {}
-
-# ================= DATA FETCH =================
-def fetch_orderflow(keys, exch):
+# ================= DEPTH FUNCTION =================
+def fetch_depth(keys):
+    if not keys:
+        return {}
     r = requests.get(
         QUOTE_URL,
         headers=HEADERS,
         params={"instrument_key": ",".join(keys)},
         timeout=15
     )
-    rows = []
+    return r.json().get("data", {})
 
-    for q in r.json().get("data", {}).values():
+# ================= MAIN SCAN =================
+def scan_exchange(keys, exch):
+    rows = []
+    now = datetime.now().strftime("%H:%M:%S")
+    data = fetch_depth(keys)
+
+    for ikey, q in data.items():
         d = q.get("depth", {})
-        bq = sum(x['quantity'] for x in d.get("buy", []))
-        sq = sum(x['quantity'] for x in d.get("sell", []))
+        bq = sum(x["quantity"] for x in d.get("buy", []))
+        sq = sum(x["quantity"] for x in d.get("sell", []))
         tot = bq + sq
         if tot == 0:
             continue
 
-        bp = round(bq*100/tot,1)
-        sp = round(sq*100/tot,1)
+        bp = round(bq * 100 / tot, 1)
+        sp = round(sq * 100 / tot, 1)
         signal = "BUY" if bp > sp else "SELL"
 
-        macd, rsi = fetch_indicators(q['instrument_token'])
+        if max(bp, sp) >= IMBALANCE_THRESHOLD:
+            sym = q["symbol"]
 
-        if max(bp,sp) >= IMBALANCE_THRESHOLD and \
-           st.session_state.last_state.get(q['symbol']) != signal:
+            rows.append({
+                "EntryTime": now,
+                "Symbol": sym,
+                "Signal": signal,
+                "BuyQty": bq,
+                "SellQty": sq,
+                "Buy%": bp,
+                "Sell%": sp
+            })
 
-            st.toast(f"{q['symbol']} → {signal}", icon="🚨")
+            if sym not in st.session_state.captured["Symbol"].values:
+                winsound.Beep(1000, 300)
+                st.session_state.captured.loc[len(st.session_state.captured)] = [
+                    now,
+                    exch,
+                    sym,
+                    ikey,     # ✅ STORE InstrumentKey
+                    signal,
+                    bp,
+                    sp,
+                    bp,
+                    sp
+                ]
+                st.session_state.captured.to_excel(EXCEL_FILE, index=False)
 
-            send_telegram(
-                f"{q['symbol']} {signal}\nBuy:{bp}% Sell:{sp}%\nMACD:{macd} RSI:{rsi}"
-            )
-
-            save_alert([
-                datetime.now(), q['symbol'], exch,
-                signal, bp, sp, macd, rsi
-            ])
-
-            st.session_state.last_state[q['symbol']] = signal
-
-        rows.append([
-            q['symbol'], bq, sq,
-            f"{bp}% 🟢" if signal=="BUY" else f"{sp}% 🔴",
-            macd, rsi
-        ])
-
-    return pd.DataFrame(
-        rows,
-        columns=["Symbol","BuyQty","SellQty","Pressure","MACD","RSI"]
-    )
-
-# ================= AUTO REFRESH =================
-st_autorefresh(interval=REFRESH_SEC*1000, key="refresh")
+    return pd.DataFrame(rows)
 
 # ================= UI =================
-tab1, tab2 = st.tabs(["📈 NSE FUTURES", "🛢 MCX FUTURES"])
+st.title("📊 Order Flow Pressure PRO")
 
+tab1, tab2, tab3 = st.tabs([
+    "🇮🇳 NSE FUTURES",
+    "🛢 MCX FUTURES",
+    "🔍 Stock-wise Live Depth"
+])
+
+# ---------- NSE ----------
 with tab1:
-    st.dataframe(fetch_orderflow(NSE_KEYS, "NSE"), use_container_width=True)
+    df = scan_exchange(NSE_KEYS, "NSE")
+    if not df.empty:
+        st.dataframe(df, use_container_width=True)
 
+# ---------- MCX ----------
 with tab2:
-    st.dataframe(fetch_orderflow(MCX_KEYS, "MCX"), use_container_width=True)
+    df = scan_exchange(MCX_KEYS, "MCX")
+    if not df.empty:
+        st.dataframe(df, use_container_width=True)
+
+# ---------- STOCK-WISE LIVE DEPTH ----------
+with tab3:
+    st.subheader("🔍 Live Depth (3-sec refresh)")
+    symbol = st.selectbox(
+        "Select Symbol",
+        sorted(SYMBOL_KEY_MAP.keys())
+    )
+
+    key = SYMBOL_KEY_MAP.get(symbol)
+    if key:
+        depth = fetch_depth([key]).get(key, {})
+        d = depth.get("depth", {})
+        bq = sum(x["quantity"] for x in d.get("buy", []))
+        sq = sum(x["quantity"] for x in d.get("sell", []))
+        tot = bq + sq
+
+        if tot > 0:
+            st.metric("Buy %", round(bq * 100 / tot, 1))
+            st.metric("Sell %", round(sq * 100 / tot, 1))
+
+# ================= UPDATE LIVE % IN CAPTURED =================
+if not st.session_state.captured.empty:
+    keys = st.session_state.captured["InstrumentKey"].dropna().unique().tolist()
+    data = fetch_depth(keys)
+
+    for i, row in st.session_state.captured.iterrows():
+        ikey = row["InstrumentKey"]
+        q = data.get(ikey)
+        if not q:
+            continue
+
+        d = q.get("depth", {})
+        bq = sum(x["quantity"] for x in d.get("buy", []))
+        sq = sum(x["quantity"] for x in d.get("sell", []))
+        tot = bq + sq
+
+        if tot > 0:
+            st.session_state.captured.at[i, "LiveBuy%"] = round(bq * 100 / tot, 1)
+            st.session_state.captured.at[i, "LiveSell%"] = round(sq * 100 / tot, 1)
+
+st.divider()
+st.subheader("📌 Captured Symbols (Persistent + Live Update)")
+st.dataframe(st.session_state.captured, use_container_width=True)
+
+# ================= AUTO REFRESH =================
+time.sleep(LIVE_REFRESH_SEC)
+st.experimental_rerun()
