@@ -1,17 +1,17 @@
 # ==========================================================
-# Upstox Smart Option Chain – PRO VIEW
+# Upstox Smart Option Chain – BUYER DECISION ENGINE
 # ==========================================================
 import streamlit as st
 import requests
 import pandas as pd
 import plotly.graph_objects as go
-import gzip, json, time, hashlib
+import gzip, json, time
 
 # ==========================================================
 # STREAMLIT CONFIG
 # ==========================================================
 st.set_page_config(page_title="Upstox Smart Option Chain Dashboard", layout="wide")
-st.title("📊 Upstox Smart Option Chain Dashboard")
+st.title("📊 Upstox Smart Option Chain Dashboard (Buyer Perspective)")
 
 # ==========================================================
 # TOKEN
@@ -87,74 +87,96 @@ def get_chain(key, expiry):
     return pd.DataFrame(rows).sort_values("Strike")
 
 # ==========================================================
-# OI LOGIC
+# BUYER INTELLIGENCE LOGIC
 # ==========================================================
-def oi_change(curr, prev):
+def oi_pct(curr, prev):
     return round2(((curr - prev) / prev * 100) if prev else 0)
 
-def market_zone(row):
-    ce, pe = row["CE_OI_chg"], row["PE_OI_chg"]
-    if ce > 5 and pe > 5:
-        return "🟡 Straddle / Range Zone"
-    if ce > 5 and pe < -5:
-        return "🔴 Short Build-up Zone"
-    if ce < -5 and pe > 5:
-        return "🟢 Long Build-up Zone"
-    if ce < -5 and pe < -5:
-        return "🔥 Short Covering Zone"
-    return "⚪ No Trade Zone"
+def fake_long_buildup(pe_oi_chg, price_move):
+    return pe_oi_chg > 5 and price_move <= 0
+
+def buyer_action(row, atm):
+    price_move = row["Spot"] - prev_spot
+
+    # Fake long build-up
+    if fake_long_buildup(row["PE_OI_chg"], price_move):
+        return "⚠️ Avoid (Put Writing Trap)"
+
+    # Safe bullish zone
+    if row["Strike"] <= atm and row["PE_OI_chg"] > 5 and price_move > 0:
+        return "✅ Buy Call (SAFE)"
+
+    # Bearish
+    if row["CE_OI_chg"] > 5 and row["PE_OI_chg"] < -5:
+        return "🔴 Buy Put"
+
+    # Range / straddle
+    if row["CE_OI_chg"] > 5 and row["PE_OI_chg"] > 5:
+        return "🟡 Avoid (Straddle Zone)"
+
+    return "⏳ Wait / No Trade"
 
 # ==========================================================
 # UI INPUTS
 # ==========================================================
-c1, c2, c3 = st.columns([2, 2, 2])
+c1, c2 = st.columns(2)
 with c1:
     symbol = st.selectbox("Symbol", sorted(symbol_map))
 key = symbol_map[symbol]
 with c2:
     expiry = st.selectbox("Expiry", get_expiries(key))
-with c3:
-    auto = st.toggle("Auto Refresh (60s)")
 
 # ==========================================================
 # LOAD DATA
 # ==========================================================
 df = get_chain(key, expiry)
 spot = df["Spot"].iloc[0]
+prev_spot = spot  # Upstox gives close; for intraday extend later
+
 df["abs"] = (df["Strike"] - spot).abs()
 atm = df.loc[df["abs"].idxmin(), "Strike"]
 
-df["CE_OI_chg"] = df.apply(lambda x: oi_change(x["CE_OI"], x["CE_prev"]), axis=1)
-df["PE_OI_chg"] = df.apply(lambda x: oi_change(x["PE_OI"], x["PE_prev"]), axis=1)
-df["Zone"] = df.apply(market_zone, axis=1)
+df["CE_OI_chg"] = df.apply(lambda x: oi_pct(x["CE_OI"], x["CE_prev"]), axis=1)
+df["PE_OI_chg"] = df.apply(lambda x: oi_pct(x["PE_OI"], x["PE_prev"]), axis=1)
+
+df["Buyer_Action"] = df.apply(lambda x: buyer_action(x, atm), axis=1)
 
 # ==========================================================
-# METRICS
+# BUY / AVOID / SELL BIAS (ATM)
 # ==========================================================
-zone_atm = df[df["Strike"] == atm]["Zone"].iloc[0]
+atm_row = df[df["Strike"] == atm].iloc[0]
+
+if "Buy Call" in atm_row["Buyer_Action"]:
+    bias = "🟢 BUY BIAS"
+elif "Buy Put" in atm_row["Buyer_Action"]:
+    bias = "🔴 SELL / PUT BIAS"
+else:
+    bias = "🟡 AVOID BUYING"
+
 m1, m2, m3 = st.columns(3)
 m1.metric("Spot", spot)
 m2.metric("ATM", atm)
-m3.metric("Market Zone", zone_atm)
+m3.metric("Bias", bias)
 
 # ==========================================================
-# EXPLAINABLE OI ALERTS
+# EXPLAINABLE OI ALERTS (ATM ZONE)
 # ==========================================================
-st.subheader("🚨 OI ACTIVITY ALERT (ATM ZONE)")
+st.subheader("🚨 OI ACTIVITY ALERT (Buyer Explanation)")
+
 alerts = df[df["Strike"].between(atm-50, atm+50)]
 for _, r in alerts.iterrows():
     if abs(r["CE_OI_chg"]) > 10 or abs(r["PE_OI_chg"]) > 10:
         st.info(
             f"""
             **Strike {r['Strike']}**
-            • CE OI: {r['CE_OI_chg']}%
-            • PE OI: {r['PE_OI_chg']}%
-            → **{r['Zone']}**
+            • CE OI Change: {r['CE_OI_chg']}%
+            • PE OI Change: {r['PE_OI_chg']}%
+            → **Buyer Action:** {r['Buyer_Action']}
             """
         )
 
 # ==========================================================
-# CLASSIC OPTION CHAIN VIEW
+# CLASSIC OPTION CHAIN VIEW (BUYER MODE)
 # ==========================================================
 classic = pd.DataFrame({
     "CE_LTP": df["CE_LTP"],
@@ -164,20 +186,19 @@ classic = pd.DataFrame({
     "PE_OI%": df["PE_OI_chg"],
     "PE_OI": df["PE_OI"],
     "PE_LTP": df["PE_LTP"],
+    "Buyer Action": df["Buyer_Action"]
 })
 
-def highlight_atm(row):
+def highlight_rows(row):
+    if "SAFE" in row["Buyer Action"]:
+        return ["background-color:#0f5132;color:white"] * len(row)
     if row["STRIKE"] == atm:
         return ["background-color:#1f4fd8;color:white;font-weight:bold"] * len(row)
+    if "Avoid" in row["Buyer Action"]:
+        return ["background-color:#fff3cd"] * len(row)
     return [""] * len(row)
 
-styled = classic.style.apply(highlight_atm, axis=1)
-st.subheader("📊 Option Chain (Classic View)")
-st.dataframe(styled, use_container_width=True)
+styled = classic.style.apply(highlight_rows, axis=1)
 
-# ==========================================================
-# AUTO REFRESH
-# ==========================================================
-if auto:
-    time.sleep(60)
-    st.rerun()
+st.subheader("📊 Option Chain (Classic – Buyer View)")
+st.dataframe(styled, use_container_width=True)
