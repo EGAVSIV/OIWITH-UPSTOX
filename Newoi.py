@@ -4,6 +4,8 @@ import json
 import pandas as pd
 import numpy as np
 import time
+import gzip
+
 
 # =====================================================
 # STREAMLIT CONFIG
@@ -27,8 +29,9 @@ def get_headers():
 # =====================================================
 # LOAD INSTRUMENT MASTER
 # =====================================================
-with open("Complete.json") as f:
+with gzip.open("Complete.json.gz", "rt", encoding="utf-8") as f:
     instruments = json.load(f)
+
 
 # Hardcoded index instrument keys (stable & safe)
 INDEX_MAP = {
