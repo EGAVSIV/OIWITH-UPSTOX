@@ -24,6 +24,7 @@ def get_headers():
 # LOAD INSTRUMENT MASTER (GZ)
 # =====================================================
 with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
+
     instruments = json.load(f)
 
 # =====================================================
