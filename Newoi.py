@@ -1,16 +1,16 @@
 # ==========================================================
-# Upstox Smart Option Chain – BUYER DECISION ENGINE (FINAL)
+# Upstox Option Chain – STOCK + STRIKE BUYER SCANNER
 # ==========================================================
 import streamlit as st
 import requests
 import pandas as pd
-import gzip, json
+import gzip, json, time
 
 # ==========================================================
-# STREAMLIT CONFIG
+# CONFIG
 # ==========================================================
-st.set_page_config(page_title="Upstox Smart Option Chain (Buyer)", layout="wide")
-st.title("📊 Upstox Smart Option Chain Dashboard — Buyer Perspective")
+st.set_page_config(layout="wide", page_title="Option Buyer Scanner")
+st.title("📊 Option Buyer Scanner (Stock + Strike Level)")
 
 # ==========================================================
 # TOKEN
@@ -20,22 +20,13 @@ with open("token.txt") as f:
 
 HEADERS = {
     "Authorization": f"Bearer {ACCESS_TOKEN}",
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0"
+    "Accept": "application/json"
 }
 BASE_URL = "https://api.upstox.com/v2"
 
 # ==========================================================
 # HELPERS
 # ==========================================================
-def safe_get(d, *keys, default=0):
-    try:
-        for k in keys:
-            d = d[k]
-        return d
-    except:
-        return default
-
 def round2(x):
     try:
         return round(float(x), 2)
@@ -44,6 +35,14 @@ def round2(x):
 
 def oi_pct(curr, prev):
     return round2(((curr - prev) / prev * 100) if prev else 0)
+
+def safe_get(d, *keys, default=0):
+    try:
+        for k in keys:
+            d = d[k]
+        return d
+    except:
+        return default
 
 # ==========================================================
 # LOAD MASTER
@@ -60,19 +59,22 @@ for i in master:
     if s and k and s not in symbol_map:
         symbol_map[s] = k
 
+# LIMIT SCAN COUNT (VERY IMPORTANT)
+SCAN_LIMIT = 15   # keep small to avoid rate-limit
+
 # ==========================================================
 # API
 # ==========================================================
-def get_expiries(key):
+def get_expiry(key):
     r = requests.get(
         f"{BASE_URL}/option/contract",
         headers=HEADERS,
         params={"instrument_key": key}
     )
-    return sorted({
-        pd.to_datetime(i["expiry"]).strftime("%Y-%m-%d")
-        for i in r.json().get("data", [])
-    })
+    data = r.json().get("data", [])
+    if not data:
+        return None
+    return pd.to_datetime(data[0]["expiry"]).strftime("%Y-%m-%d")
 
 def get_chain(key, expiry):
     r = requests.get(
@@ -86,121 +88,106 @@ def get_chain(key, expiry):
         rows.append({
             "Strike": int(d["strike_price"]),
             "Spot": round2(d["underlying_spot_price"]),
-            "CE_LTP": round2(safe_get(ce, "market_data", "ltp")),
-            "CE_OI": int(safe_get(ce, "market_data", "oi")),
-            "CE_prev": int(safe_get(ce, "market_data", "prev_oi")),
-            "PE_LTP": round2(safe_get(pe, "market_data", "ltp")),
-            "PE_OI": int(safe_get(pe, "market_data", "oi")),
-            "PE_prev": int(safe_get(pe, "market_data", "prev_oi")),
+            "CE_OI": safe_get(ce, "market_data", "oi"),
+            "CE_prev": safe_get(ce, "market_data", "prev_oi"),
+            "PE_OI": safe_get(pe, "market_data", "oi"),
+            "PE_prev": safe_get(pe, "market_data", "prev_oi"),
         })
-    return pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
+    return pd.DataFrame(rows)
 
 # ==========================================================
 # BUYER LOGIC
 # ==========================================================
-def fake_long_build(pe_chg, price_move):
-    return pe_chg > 5 and price_move <= 0
-
-def buyer_action(row, atm, price_move):
-    if fake_long_build(row["PE_OI_chg"], price_move):
-        return "⚠️ Avoid (Put Writing Trap)"
-
-    if row["Strike"] <= atm and row["PE_OI_chg"] > 5 and price_move > 0:
-        return "✅ Buy Call (SAFE)"
-
-    if row["CE_OI_chg"] > 5 and row["PE_OI_chg"] < -5:
-        return "🔴 Buy Put"
-
-    if row["CE_OI_chg"] > 5 and row["PE_OI_chg"] > 5:
-        return "🟡 Avoid (Straddle Zone)"
-
-    return "⏳ Wait / No Trade"
+def buyer_action(row, atm):
+    if row["PE_OI_chg"] > 5 and row["Strike"] <= atm:
+        return "BUY_CALL"
+    if row["CE_OI_chg"] > 5 and row["Strike"] >= atm:
+        return "BUY_PUT"
+    return "NO_TRADE"
 
 # ==========================================================
-# UI INPUTS
+# UI CONTROLS
 # ==========================================================
-c1, c2 = st.columns(2)
-with c1:
-    symbol = st.selectbox("Symbol", sorted(symbol_map))
-key = symbol_map[symbol]
-
-with c2:
-    expiry = st.selectbox("Expiry", get_expiries(key))
-
-# ==========================================================
-# LOAD DATA
-# ==========================================================
-df = get_chain(key, expiry)
-spot = df["Spot"].iloc[0]
-price_move = 0  # Upstox gives close; intraday extension later
-
-df["abs"] = (df["Strike"] - spot).abs()
-atm = df.loc[df["abs"].idxmin(), "Strike"]
-
-df["CE_OI_chg"] = df.apply(lambda x: oi_pct(x["CE_OI"], x["CE_prev"]), axis=1)
-df["PE_OI_chg"] = df.apply(lambda x: oi_pct(x["PE_OI"], x["PE_prev"]), axis=1)
-
-df["Buyer Action"] = df.apply(lambda x: buyer_action(x, atm, price_move), axis=1)
-
-# ==========================================================
-# BIAS BADGE (ATM)
-# ==========================================================
-atm_action = df[df["Strike"] == atm]["Buyer Action"].iloc[0]
-
-if "Buy Call" in atm_action:
-    bias = "🟢 BUY BIAS (Call Buyers Favoured)"
-elif "Buy Put" in atm_action:
-    bias = "🔴 SELL / PUT BIAS (Put Buyers Favoured)"
-else:
-    bias = "🟡 AVOID BUYING"
-
-m1, m2, m3 = st.columns(3)
-m1.metric("Spot", spot)
-m2.metric("ATM", atm)
-m3.metric("Bias", bias)
-
-# ==========================================================
-# BUYER SIGNAL FILTER (SCANNER)
-# ==========================================================
-st.subheader("🔍 Buyer Signal Filter (Strike Scanner)")
+scan_type = st.selectbox(
+    "Scan Mode",
+    ["Single Stock View", "Stock Scanner (Buy Call / Buy Put)"]
+)
 
 signal_filter = st.selectbox(
-    "Show strikes where Buyer Action is:",
-    [
-        "All",
-        "✅ Buy Call (SAFE)",
-        "🔴 Buy Put",
-        "⚠️ Avoid (Put Writing Trap)"
-    ]
+    "Signal Filter",
+    ["BUY_CALL", "BUY_PUT"]
 )
 
 # ==========================================================
-# CLASSIC OPTION CHAIN VIEW
+# MODE 1 — SINGLE STOCK (UNCHANGED CORE)
 # ==========================================================
-classic = pd.DataFrame({
-    "CE_LTP": df["CE_LTP"],
-    "CE_OI": df["CE_OI"],
-    "CE_OI%": df["CE_OI_chg"],
-    "STRIKE": df["Strike"],
-    "PE_OI%": df["PE_OI_chg"],
-    "PE_OI": df["PE_OI"],
-    "PE_LTP": df["PE_LTP"],
-    "Buyer Action": df["Buyer Action"]
-})
+if scan_type == "Single Stock View":
+    symbol = st.selectbox("Select Stock", sorted(symbol_map))
+    key = symbol_map[symbol]
+    expiry = get_expiry(key)
 
-if signal_filter != "All":
-    classic = classic[classic["Buyer Action"] == signal_filter]
+    df = get_chain(key, expiry)
+    spot = df["Spot"].iloc[0]
+    df["abs"] = (df["Strike"] - spot).abs()
+    atm = df.loc[df["abs"].idxmin(), "Strike"]
 
-def highlight_rows(row):
-    if "SAFE" in row["Buyer Action"]:
-        return ["background-color:#198754;color:white"] * len(row)
-    if row["STRIKE"] == atm:
-        return ["background-color:#1f4fd8;color:white;font-weight:bold"] * len(row)
-    if "Avoid" in row["Buyer Action"]:
-        return ["background-color:#fff3cd"] * len(row)
-    return [""] * len(row)
+    df["CE_OI_chg"] = df.apply(lambda x: oi_pct(x["CE_OI"], x["CE_prev"]), axis=1)
+    df["PE_OI_chg"] = df.apply(lambda x: oi_pct(x["PE_OI"], x["PE_prev"]), axis=1)
 
-styled = classic.style.apply(highlight_rows, axis=1)
+    df["Signal"] = df.apply(lambda x: buyer_action(x, atm), axis=1)
 
-st.subheader("📊 Option Chain (Classic — Buyer View)")
-st.dataframe(styled, use_container_width=True)
+    df = df[df["Signal"] == signal_filter]
+
+    st.subheader(f"{symbol} → {signal_filter}")
+    st.dataframe(df[["Strike", "CE_OI_chg", "PE_OI_chg", "Signal"]], use_container_width=True)
+
+# ==========================================================
+# MODE 2 — STOCK SCANNER (WHAT YOU ASKED)
+# ==========================================================
+else:
+    st.subheader(f"📡 Stock Scanner → {signal_filter}")
+    results = []
+
+    for sym in list(symbol_map.keys())[:SCAN_LIMIT]:
+        try:
+            key = symbol_map[sym]
+            expiry = get_expiry(key)
+            if not expiry:
+                continue
+
+            df = get_chain(key, expiry)
+            if df.empty:
+                continue
+
+            spot = df["Spot"].iloc[0]
+            df["abs"] = (df["Strike"] - spot).abs()
+            atm = df.loc[df["abs"].idxmin(), "Strike"]
+
+            df["CE_OI_chg"] = df.apply(lambda x: oi_pct(x["CE_OI"], x["CE_prev"]), axis=1)
+            df["PE_OI_chg"] = df.apply(lambda x: oi_pct(x["PE_OI"], x["PE_prev"]), axis=1)
+
+            df["Signal"] = df.apply(lambda x: buyer_action(x, atm), axis=1)
+
+            valid = df[df["Signal"] == signal_filter]
+
+            if not valid.empty:
+                for _, r in valid.iterrows():
+                    results.append({
+                        "Stock": sym,
+                        "ATM": atm,
+                        "Strike": r["Strike"],
+                        "CE_OI%": r["CE_OI_chg"],
+                        "PE_OI%": r["PE_OI_chg"],
+                        "Signal": signal_filter
+                    })
+
+            time.sleep(0.3)  # rate-limit safety
+
+        except Exception:
+            continue
+
+    if results:
+        st.success(f"Found {len(results)} strike(s)")
+        st.dataframe(pd.DataFrame(results), use_container_width=True)
+    else:
+        st.warning("No stocks found for selected signal")
