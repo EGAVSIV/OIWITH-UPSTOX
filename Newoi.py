@@ -1,45 +1,48 @@
-# ================================
-# Upstox Option Chain – Full Smart Dashboard
-# ================================
+# ==========================================================
+# Upstox Smart Option Chain Dashboard
+# ==========================================================
 import streamlit as st
 import requests
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import gzip, json, time, hashlib
 from datetime import datetime
 
-# ================= LOGIN =================
+# ==========================================================
+# OPTIONAL LOGIN (SAFE FALLBACK)
+# ==========================================================
 def hash_pwd(pwd):
     return hashlib.sha256(pwd.encode()).hexdigest()
 
-USERS = st.secrets["users"]
+USERS = st.secrets.get("users", None)
 
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+if USERS:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
 
-if not st.session_state.authenticated:
-    st.title("🔐 Login Required")
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if u in USERS and hash_pwd(p) == USERS[u]:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Invalid credentials")
-    st.stop()
+    if not st.session_state.authenticated:
+        st.title("🔐 Login Required")
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.button("Login"):
+            if u in USERS and hash_pwd(p) == USERS[u]:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+        st.stop()
 
-# ================= CONFIG =================
+# ==========================================================
+# STREAMLIT CONFIG
+# ==========================================================
 st.set_page_config(page_title="Upstox Smart Option Chain", layout="wide")
 st.title("📊 Upstox Smart Option Chain Dashboard")
 
-# ================= TOKEN =================
-def load_access_token():
-    with open("token.txt") as f:
-        return f.read().strip()
-
-ACCESS_TOKEN = load_access_token()
+# ==========================================================
+# TOKEN
+# ==========================================================
+with open("token.txt") as f:
+    ACCESS_TOKEN = f.read().strip()
 
 HEADERS = {
     "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -48,7 +51,9 @@ HEADERS = {
 }
 BASE_URL = "https://api.upstox.com/v2"
 
-# ================= HELPERS =================
+# ==========================================================
+# HELPERS
+# ==========================================================
 def safe_get(d, *keys, default=0):
     try:
         for k in keys:
@@ -63,7 +68,9 @@ def ts_to_ymd(v):
     except:
         return None
 
-# ================= LOAD MASTER =================
+# ==========================================================
+# LOAD MASTER FILE
+# ==========================================================
 @st.cache_data(show_spinner=False)
 def load_master():
     with gzip.open("complete.json.gz", "rt", encoding="utf-8") as f:
@@ -78,7 +85,9 @@ for item in master:
     if sym and key and sym not in symbol_map:
         symbol_map[sym] = key
 
-# ================= API =================
+# ==========================================================
+# API CALLS
+# ==========================================================
 def get_expiries(instrument_key):
     r = requests.get(
         f"{BASE_URL}/option/contract",
@@ -95,10 +104,7 @@ def get_option_chain(instrument_key, expiry):
     r = requests.get(
         f"{BASE_URL}/option/chain",
         headers=HEADERS,
-        params={
-            "instrument_key": instrument_key,
-            "expiry_date": expiry
-        },
+        params={"instrument_key": instrument_key, "expiry_date": expiry},
         timeout=10
     )
     if r.status_code != 200:
@@ -122,9 +128,11 @@ def get_option_chain(instrument_key, expiry):
     df = pd.DataFrame(rows)
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    return df.sort_values("Strike")
+    return df.sort_values("Strike").reset_index(drop=True)
 
-# ================= ANALYTICS =================
+# ==========================================================
+# ANALYTICS
+# ==========================================================
 def max_pain(df):
     strikes = df["Strike"].values
     pain = {}
@@ -145,8 +153,23 @@ def oi_buildup(price_chg, oi_chg):
         return "⚪ Long Unwinding"
     return ""
 
-# ================= UI =================
-c1, c2, c3 = st.columns([2, 2, 2])
+def intraday_sr(df):
+    support = df.loc[df["PE_OI"].idxmax(), "Strike"]
+    resistance = df.loc[df["CE_OI"].idxmax(), "Strike"]
+    return support, resistance
+
+def strong_oi_alert(row, threshold=10):
+    alerts = []
+    if abs(row["CE_OI_chg%"]) >= threshold:
+        alerts.append(f"CE {row['CE_OI_chg%']:.1f}%")
+    if abs(row["PE_OI_chg%"]) >= threshold:
+        alerts.append(f"PE {row['PE_OI_chg%']:.1f}%")
+    return " | ".join(alerts)
+
+# ==========================================================
+# UI INPUTS
+# ==========================================================
+c1, c2, c3 = st.columns(3)
 
 with c1:
     symbol = st.selectbox("Symbol", sorted(symbol_map.keys()))
@@ -160,9 +183,12 @@ with c2:
 with c3:
     auto = st.toggle("Auto Refresh (60s)")
 
+# ==========================================================
+# LOAD DATA
+# ==========================================================
 df = get_option_chain(instrument_key, expiry)
 if df.empty:
-    st.error("No option chain data")
+    st.error("Option chain not available")
     st.stop()
 
 spot = df["Spot"].iloc[0]
@@ -175,27 +201,76 @@ df["PE_OI_chg%"] = (df["PE_OI"] - df["PE_prev_OI"]) / df["PE_prev_OI"].replace(0
 df["CE_Buildup"] = df.apply(lambda x: oi_buildup(x["CE_LTP"], x["CE_OI_chg%"]), axis=1)
 df["PE_Buildup"] = df.apply(lambda x: oi_buildup(x["PE_LTP"], x["PE_OI_chg%"]), axis=1)
 
+# ==========================================================
+# FORMAT NUMBERS (NO EXTRA DECIMALS)
+# ==========================================================
+for c in ["Strike", "CE_OI", "CE_prev_OI", "PE_OI", "PE_prev_OI"]:
+    df[c] = df[c].round(0).astype(int)
+
+for c in ["Spot", "CE_LTP", "PE_LTP", "CE_OI_chg%", "PE_OI_chg%"]:
+    df[c] = df[c].round(2)
+
+# ==========================================================
+# METRICS + STRATEGY
+# ==========================================================
 mp = max_pain(df)
+support, resistance = intraday_sr(df)
 
-# ================= METRICS =================
-m1, m2, m3 = st.columns(3)
-m1.metric("Spot", round(spot, 2))
-m2.metric("ATM", int(atm))
-m3.metric("Max Pain", int(mp))
+atm_row = df[df["Strike"] == atm].iloc[0]
+strategy = "No Trade"
 
-# ================= CHART =================
+if atm_row["CE_OI_chg%"] > 5 and atm_row["PE_OI_chg%"] > 5:
+    strategy = "🟡 Short Straddle"
+elif atm_row["PE_OI_chg%"] > 5 and atm_row["CE_OI_chg%"] < -5:
+    strategy = "🟢 Bullish Directional"
+elif atm_row["CE_OI_chg%"] > 5 and atm_row["PE_OI_chg%"] < -5:
+    strategy = "🔴 Bearish Directional"
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Spot", spot)
+m2.metric("ATM", atm)
+m3.metric("Max Pain", mp)
+m4.metric("Strategy", strategy)
+
+# ==========================================================
+# OI ALERTS (ATM ZONE)
+# ==========================================================
+df["OI_Alert"] = df.apply(strong_oi_alert, axis=1)
+alerts = df[df["Strike"].between(atm-50, atm+50) & (df["OI_Alert"] != "")]
+if not alerts.empty:
+    st.warning("🚨 OI ACTIVITY ALERT (ATM ZONE)")
+    for _, r in alerts.iterrows():
+        st.write(f"Strike {r['Strike']} → {r['OI_Alert']}")
+
+# ==========================================================
+# OI BAR CHART WITH S/R
+# ==========================================================
 fig = go.Figure()
 fig.add_bar(x=df["Strike"], y=df["CE_OI"], name="CE OI", marker_color="green")
 fig.add_bar(x=df["Strike"], y=df["PE_OI"], name="PE OI", marker_color="red")
-fig.add_vline(x=atm, line_dash="dash", line_color="orange")
+fig.add_vline(x=atm, line_dash="dash", line_color="orange", annotation_text="ATM")
+fig.add_vline(x=support, line_dash="dot", line_color="green", annotation_text="Support")
+fig.add_vline(x=resistance, line_dash="dot", line_color="red", annotation_text="Resistance")
 st.plotly_chart(fig, use_container_width=True)
 
-# ================= HEATMAP =================
-def heat(val, maxv):
-    return f"background-color: rgba(255,0,0,{min(abs(val)/maxv,1)})"
+# ==========================================================
+# ATM ROW HIGHLIGHT + HEATMAP
+# ==========================================================
+def highlight_atm(row):
+    if row["Strike"] == atm:
+        return ["background-color:#1f4fd8;color:white;font-weight:bold"] * len(row)
+    return [""] * len(row)
 
 max_oi = max(df["CE_OI"].max(), df["PE_OI"].max(), 1)
-styled = df.style.applymap(lambda v: heat(v, max_oi), subset=["CE_OI", "PE_OI"])
+
+def heat(val):
+    return f"background-color: rgba(255,0,0,{min(abs(val)/max_oi,1)})"
+
+styled = df.style \
+    .apply(highlight_atm, axis=1) \
+    .applymap(heat, subset=["CE_OI", "PE_OI"])
+
+st.subheader("📊 Option Chain (ATM Highlighted)")
 st.dataframe(styled, use_container_width=True)
 
 if auto:
