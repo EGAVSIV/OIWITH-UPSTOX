@@ -1,16 +1,17 @@
 # ==========================================================
-# Upstox Option Chain – STOCK + STRIKE BUYER SCANNER
+# Upstox Smart Option Chain – PRO VIEW
 # ==========================================================
 import streamlit as st
 import requests
 import pandas as pd
-import gzip, json, time
+import plotly.graph_objects as go
+import gzip, json, time, hashlib
 
 # ==========================================================
-# CONFIG
+# STREAMLIT CONFIG
 # ==========================================================
-st.set_page_config(layout="wide", page_title="Option Buyer Scanner")
-st.title("📊 Option Buyer Scanner (Stock + Strike Level)")
+st.set_page_config(page_title="Upstox Smart Option Chain Dashboard", layout="wide")
+st.title("📊 Upstox Smart Option Chain Dashboard")
 
 # ==========================================================
 # TOKEN
@@ -20,22 +21,14 @@ with open("token.txt") as f:
 
 HEADERS = {
     "Authorization": f"Bearer {ACCESS_TOKEN}",
-    "Accept": "application/json"
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0"
 }
 BASE_URL = "https://api.upstox.com/v2"
 
 # ==========================================================
 # HELPERS
 # ==========================================================
-def round2(x):
-    try:
-        return round(float(x), 2)
-    except:
-        return 0.0
-
-def oi_pct(curr, prev):
-    return round2(((curr - prev) / prev * 100) if prev else 0)
-
 def safe_get(d, *keys, default=0):
     try:
         for k in keys:
@@ -43,6 +36,12 @@ def safe_get(d, *keys, default=0):
         return d
     except:
         return default
+
+def round2(x):
+    try:
+        return round(float(x), 2)
+    except:
+        return 0.0
 
 # ==========================================================
 # LOAD MASTER
@@ -59,22 +58,12 @@ for i in master:
     if s and k and s not in symbol_map:
         symbol_map[s] = k
 
-# LIMIT SCAN COUNT (VERY IMPORTANT)
-SCAN_LIMIT = 15   # keep small to avoid rate-limit
-
 # ==========================================================
 # API
 # ==========================================================
-def get_expiry(key):
-    r = requests.get(
-        f"{BASE_URL}/option/contract",
-        headers=HEADERS,
-        params={"instrument_key": key}
-    )
-    data = r.json().get("data", [])
-    if not data:
-        return None
-    return pd.to_datetime(data[0]["expiry"]).strftime("%Y-%m-%d")
+def get_expiries(key):
+    r = requests.get(f"{BASE_URL}/option/contract", headers=HEADERS, params={"instrument_key": key})
+    return sorted({pd.to_datetime(i["expiry"]).strftime("%Y-%m-%d") for i in r.json().get("data", [])})
 
 def get_chain(key, expiry):
     r = requests.get(
@@ -88,106 +77,107 @@ def get_chain(key, expiry):
         rows.append({
             "Strike": int(d["strike_price"]),
             "Spot": round2(d["underlying_spot_price"]),
-            "CE_OI": safe_get(ce, "market_data", "oi"),
-            "CE_prev": safe_get(ce, "market_data", "prev_oi"),
-            "PE_OI": safe_get(pe, "market_data", "oi"),
-            "PE_prev": safe_get(pe, "market_data", "prev_oi"),
+            "CE_LTP": round2(safe_get(ce, "market_data", "ltp")),
+            "CE_OI": int(safe_get(ce, "market_data", "oi")),
+            "CE_prev": int(safe_get(ce, "market_data", "prev_oi")),
+            "PE_LTP": round2(safe_get(pe, "market_data", "ltp")),
+            "PE_OI": int(safe_get(pe, "market_data", "oi")),
+            "PE_prev": int(safe_get(pe, "market_data", "prev_oi")),
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).sort_values("Strike")
 
 # ==========================================================
-# BUYER LOGIC
+# OI LOGIC
 # ==========================================================
-def buyer_action(row, atm):
-    if row["PE_OI_chg"] > 5 and row["Strike"] <= atm:
-        return "BUY_CALL"
-    if row["CE_OI_chg"] > 5 and row["Strike"] >= atm:
-        return "BUY_PUT"
-    return "NO_TRADE"
+def oi_change(curr, prev):
+    return round2(((curr - prev) / prev * 100) if prev else 0)
 
-# ==========================================================
-# UI CONTROLS
-# ==========================================================
-scan_type = st.selectbox(
-    "Scan Mode",
-    ["Single Stock View", "Stock Scanner (Buy Call / Buy Put)"]
-)
-
-signal_filter = st.selectbox(
-    "Signal Filter",
-    ["BUY_CALL", "BUY_PUT"]
-)
+def market_zone(row):
+    ce, pe = row["CE_OI_chg"], row["PE_OI_chg"]
+    if ce > 5 and pe > 5:
+        return "🟡 Straddle / Range Zone"
+    if ce > 5 and pe < -5:
+        return "🔴 Short Build-up Zone"
+    if ce < -5 and pe > 5:
+        return "🟢 Long Build-up Zone"
+    if ce < -5 and pe < -5:
+        return "🔥 Short Covering Zone"
+    return "⚪ No Trade Zone"
 
 # ==========================================================
-# MODE 1 — SINGLE STOCK (UNCHANGED CORE)
+# UI INPUTS
 # ==========================================================
-if scan_type == "Single Stock View":
-    symbol = st.selectbox("Select Stock", sorted(symbol_map))
-    key = symbol_map[symbol]
-    expiry = get_expiry(key)
-
-    df = get_chain(key, expiry)
-    spot = df["Spot"].iloc[0]
-    df["abs"] = (df["Strike"] - spot).abs()
-    atm = df.loc[df["abs"].idxmin(), "Strike"]
-
-    df["CE_OI_chg"] = df.apply(lambda x: oi_pct(x["CE_OI"], x["CE_prev"]), axis=1)
-    df["PE_OI_chg"] = df.apply(lambda x: oi_pct(x["PE_OI"], x["PE_prev"]), axis=1)
-
-    df["Signal"] = df.apply(lambda x: buyer_action(x, atm), axis=1)
-
-    df = df[df["Signal"] == signal_filter]
-
-    st.subheader(f"{symbol} → {signal_filter}")
-    st.dataframe(df[["Strike", "CE_OI_chg", "PE_OI_chg", "Signal"]], use_container_width=True)
+c1, c2, c3 = st.columns([2, 2, 2])
+with c1:
+    symbol = st.selectbox("Symbol", sorted(symbol_map))
+key = symbol_map[symbol]
+with c2:
+    expiry = st.selectbox("Expiry", get_expiries(key))
+with c3:
+    auto = st.toggle("Auto Refresh (60s)")
 
 # ==========================================================
-# MODE 2 — STOCK SCANNER (WHAT YOU ASKED)
+# LOAD DATA
 # ==========================================================
-else:
-    st.subheader(f"📡 Stock Scanner → {signal_filter}")
-    results = []
+df = get_chain(key, expiry)
+spot = df["Spot"].iloc[0]
+df["abs"] = (df["Strike"] - spot).abs()
+atm = df.loc[df["abs"].idxmin(), "Strike"]
 
-    for sym in list(symbol_map.keys())[:SCAN_LIMIT]:
-        try:
-            key = symbol_map[sym]
-            expiry = get_expiry(key)
-            if not expiry:
-                continue
+df["CE_OI_chg"] = df.apply(lambda x: oi_change(x["CE_OI"], x["CE_prev"]), axis=1)
+df["PE_OI_chg"] = df.apply(lambda x: oi_change(x["PE_OI"], x["PE_prev"]), axis=1)
+df["Zone"] = df.apply(market_zone, axis=1)
 
-            df = get_chain(key, expiry)
-            if df.empty:
-                continue
+# ==========================================================
+# METRICS
+# ==========================================================
+zone_atm = df[df["Strike"] == atm]["Zone"].iloc[0]
+m1, m2, m3 = st.columns(3)
+m1.metric("Spot", spot)
+m2.metric("ATM", atm)
+m3.metric("Market Zone", zone_atm)
 
-            spot = df["Spot"].iloc[0]
-            df["abs"] = (df["Strike"] - spot).abs()
-            atm = df.loc[df["abs"].idxmin(), "Strike"]
+# ==========================================================
+# EXPLAINABLE OI ALERTS
+# ==========================================================
+st.subheader("🚨 OI ACTIVITY ALERT (ATM ZONE)")
+alerts = df[df["Strike"].between(atm-50, atm+50)]
+for _, r in alerts.iterrows():
+    if abs(r["CE_OI_chg"]) > 10 or abs(r["PE_OI_chg"]) > 10:
+        st.info(
+            f"""
+            **Strike {r['Strike']}**
+            • CE OI: {r['CE_OI_chg']}%
+            • PE OI: {r['PE_OI_chg']}%
+            → **{r['Zone']}**
+            """
+        )
 
-            df["CE_OI_chg"] = df.apply(lambda x: oi_pct(x["CE_OI"], x["CE_prev"]), axis=1)
-            df["PE_OI_chg"] = df.apply(lambda x: oi_pct(x["PE_OI"], x["PE_prev"]), axis=1)
+# ==========================================================
+# CLASSIC OPTION CHAIN VIEW
+# ==========================================================
+classic = pd.DataFrame({
+    "CE_LTP": df["CE_LTP"],
+    "CE_OI": df["CE_OI"],
+    "CE_OI%": df["CE_OI_chg"],
+    "STRIKE": df["Strike"],
+    "PE_OI%": df["PE_OI_chg"],
+    "PE_OI": df["PE_OI"],
+    "PE_LTP": df["PE_LTP"],
+})
 
-            df["Signal"] = df.apply(lambda x: buyer_action(x, atm), axis=1)
+def highlight_atm(row):
+    if row["STRIKE"] == atm:
+        return ["background-color:#1f4fd8;color:white;font-weight:bold"] * len(row)
+    return [""] * len(row)
 
-            valid = df[df["Signal"] == signal_filter]
+styled = classic.style.apply(highlight_atm, axis=1)
+st.subheader("📊 Option Chain (Classic View)")
+st.dataframe(styled, use_container_width=True)
 
-            if not valid.empty:
-                for _, r in valid.iterrows():
-                    results.append({
-                        "Stock": sym,
-                        "ATM": atm,
-                        "Strike": r["Strike"],
-                        "CE_OI%": r["CE_OI_chg"],
-                        "PE_OI%": r["PE_OI_chg"],
-                        "Signal": signal_filter
-                    })
-
-            time.sleep(0.3)  # rate-limit safety
-
-        except Exception:
-            continue
-
-    if results:
-        st.success(f"Found {len(results)} strike(s)")
-        st.dataframe(pd.DataFrame(results), use_container_width=True)
-    else:
-        st.warning("No stocks found for selected signal")
+# ==========================================================
+# AUTO REFRESH
+# ==========================================================
+if auto:
+    time.sleep(60)
+    st.rerun()
