@@ -175,6 +175,116 @@ styled = classic.style.apply(highlight_atm, axis=1)
 st.subheader("📊 Option Chain (Classic View)")
 st.dataframe(styled, use_container_width=True)
 
+
+st.subheader("🔎 Scanner 1 – OTM Strike OI Decay Analysis")
+
+# Identify OTM Strikes
+call_otm = df[df["Strike"] > spot]     # Call OTM
+put_otm  = df[df["Strike"] < spot]     # Put OTM
+
+scanner1_results = []
+
+for _, row in df.iterrows():
+
+    strike = row["Strike"]
+
+    ce_chg = row["CE_OI_chg"]
+    pe_chg = row["PE_OI_chg"]
+
+    label = None
+    score = None
+
+    # ==============================
+    # CALL OTM LOGIC (Bullish Bias)
+    # ==============================
+    if strike > spot:
+
+        if pe_chg < 0 and ce_chg < 0:
+            label = "🟢 Mild Bullish"
+            score = 1000
+
+        if pe_chg > 0 and ce_chg < 0:
+            label = "🚀 Strong Bullish"
+            score = 1000
+
+    # ==============================
+    # PUT OTM LOGIC (Bearish Bias)
+    # ==============================
+    if strike < spot:
+
+        if pe_chg < 0 and ce_chg > 0:
+            label = "🔴 Bearish"
+            score = 900
+
+        if pe_chg < 0 and ce_chg < 0:
+            label = "⚠ Mild Bearish"
+            score = 900
+
+    if label:
+        scanner1_results.append({
+            "Strike": strike,
+            "CE_OI%": ce_chg,
+            "PE_OI%": pe_chg,
+            "Signal": label,
+            "Score": score
+        })
+
+if scanner1_results:
+    st.dataframe(pd.DataFrame(scanner1_results), use_container_width=True)
+else:
+    st.info("No OTM Decay Signals Found")
+
+
+
+st.subheader("⚡ Scanner 2 – Option Price Momentum Strength")
+
+scanner2_results = []
+
+for _, row in df.iterrows():
+
+    strike = row["Strike"]
+
+    ce_oi_chg = row["CE_OI_chg"]
+    pe_oi_chg = row["PE_OI_chg"]
+
+    ce_price = row["CE_LTP"]
+    pe_price = row["PE_LTP"]
+
+    # CALL SIDE
+    if ce_oi_chg < 0 and ce_price > 0:
+        scanner2_results.append({
+            "Strike": strike,
+            "Type": "CALL",
+            "Signal": "🚀 Strong Bullish (Call Short Covering)"
+        })
+
+    if ce_oi_chg > 0 and ce_price < row["CE_LTP"]:
+        scanner2_results.append({
+            "Strike": strike,
+            "Type": "CALL",
+            "Signal": "🔴 Strong Bearish (Call Writing)"
+        })
+
+    # PUT SIDE
+    if pe_oi_chg < 0 and pe_price > 0:
+        scanner2_results.append({
+            "Strike": strike,
+            "Type": "PUT",
+            "Signal": "🔴 Strong Bearish (Put Short Covering)"
+        })
+
+    if pe_oi_chg > 0 and pe_price < row["PE_LTP"]:
+        scanner2_results.append({
+            "Strike": strike,
+            "Type": "PUT",
+            "Signal": "🚀 Strong Bullish (Put Writing)"
+        })
+
+if scanner2_results:
+    st.dataframe(pd.DataFrame(scanner2_results), use_container_width=True)
+else:
+    st.info("No Strong Momentum Strikes Found")
+
 # ==========================================================
 # AUTO REFRESH
 # ==========================================================
