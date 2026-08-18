@@ -1,6 +1,4 @@
-# oidecay.py — Full OTM CE & PE Scanner (with close price + footer)
-
-
+# oidecay.py — ATM/OTM1/OTM2 CE & PE OI Decay Scanner (with close price + footer)
 
 
 import streamlit as st
@@ -11,15 +9,6 @@ import gzip, json
 from datetime import datetime
 import hashlib
 import time
-
-
-
-
-
-
-
-
-
 
 
 def hash_pwd(pwd):
@@ -46,7 +35,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ---------------------------- CONFIG ----------------------------
-st.set_page_config(page_title="OTM OI Decay Scanner", layout="wide",page_icon="🚦")
+st.set_page_config(page_title="OTM OI Decay Scanner", layout="wide", page_icon="🚦")
 
 # 🔄 MANUAL + AUTO REFRESH (NO EXTERNAL LIB)
 # =====================================================
@@ -61,7 +50,7 @@ with c2:
     auto_refresh = st.toggle("⏱ Auto Refresh (3 min)", value=False)
 
 with c3:
-    st.caption("Manual refresh forces fresh NOAA weather + NG demand recalculation")
+    st.caption("Manual refresh forces fresh chain + OI recalculation")
 # =====================================================
 # AUTO REFRESH TIMER (SAFE)
 # =====================================================
@@ -69,7 +58,7 @@ if auto_refresh:
     now = time.time()
     last = st.session_state.get("last_refresh", 0)
 
-    if now - last > 3 * 60:  # 30 minutes
+    if now - last > 3 * 60:  # 3 minutes
         st.session_state["last_refresh"] = now
         st.cache_data.clear()
         st.rerun()
@@ -110,17 +99,6 @@ master = load_master()
 symbols = sorted({x["underlying_symbol"] for x in master if x.get("underlying_symbol")})
 
 
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------- EXPIRY FORMAT SAFE ----------------------------
 
 
@@ -146,10 +124,6 @@ def get_expiries(instrument_key):
     url = f"{BASE_URL}/option/contract"
     r = requests.get(url, headers=HEADERS, params={"instrument_key": instrument_key})
 
-
-
-
-
     if r.status_code != 200:
         return []
 
@@ -162,16 +136,12 @@ def get_expiries(instrument_key):
     return sorted(set(out))
 
 
-
 # ---------------------------- GET CHAIN ----------------------------
-
 
 
 def get_chain(inst, expiry):
     url = f"{BASE_URL}/option/chain"
     r = requests.get(url, headers=HEADERS, params={"instrument_key": inst, "expiry_date": expiry})
-
-
 
     if r.status_code != 200:
         return pd.DataFrame()
@@ -204,7 +174,6 @@ def get_chain(inst, expiry):
     return df
 
 
-
 # ---------------------------- GET INSTRUMENT KEY ----------------------------
 sym_to_inst = {}
 
@@ -215,18 +184,40 @@ for x in master:
         sym_to_inst[sy] = uk
 
 
+# ---------------------------- HELPERS ----------------------------
+def decay_pct(oi, prev_oi):
+    """% change in OI. Negative = OI decayed, Positive = OI built up."""
+    if prev_oi == 0:
+        return 0.0
+    return ((oi - prev_oi) / prev_oi) * 100
+
+
+def get_row_by_strike(df, strike):
+    r = df[df["Strike"] == strike]
+    return r.iloc[0] if not r.empty else None
+
+
 # ---------------------------- UI ----------------------------
-st.title("📉 OTM1/2/3 OI Decay Scanner")
+st.title("📉 ATM/OTM1/OTM2 OI Decay Scanner")
 
 decay_limit = st.number_input(
-    "Minimum OI Decay % (negative, ex: -20 means -20% drop)",
-    value=-20.0,
+    "OI Decay Threshold % (negative, ex: -5 means decay of -5% or worse)",
+    value=-5.0,
     step=0.5
 )
 
 st.write("Scanning all symbols…")
 
 # ---------------------------- PROCESS ALL ----------------------------
+# Logic:
+#
+# CALL SIGNAL:
+#   CE side (ATM, OTM1, OTM2) all decaying beyond decay_limit (e.g. <= -5%)
+#   AND opposite side PE (ATM, OTM1) building — positive OI change
+#
+# PUT SIGNAL:
+#   PE side (ATM, OTM1, OTM2) all decaying beyond decay_limit (e.g. <= -5%)
+#   AND opposite side CE (ATM, OTM1, OTM2) all building — positive OI change
 
 out_rows = []
 
@@ -247,40 +238,85 @@ for sym in symbols:
 
     spot = float(df["Spot"].iloc[0])
 
-    # OTM CE = Strike > spot
-    ce_otm = df[df["Strike"] > spot].sort_values("Strike").head(3)
+    strikes = sorted(df["Strike"].unique())
+    if len(strikes) < 5:
+        continue
 
-    # OTM PE = Strike < spot
-    pe_otm = df[df["Strike"] < spot].sort_values("Strike", ascending=False).head(3)
+    # ATM strike = closest strike to spot
+    atm_strike = min(strikes, key=lambda s: abs(s - spot))
+    atm_idx = strikes.index(atm_strike)
 
-    # compute decay (negative means reduction)
-    ce_otm["CE_decay"] = ((ce_otm["CE_OI"] - ce_otm["CE_prev_OI"]) / ce_otm["CE_prev_OI"].replace(0, 1)) * 100
-    pe_otm["PE_decay"] = ((pe_otm["PE_OI"] - pe_otm["PE_prev_OI"]) / pe_otm["PE_prev_OI"].replace(0, 1)) * 100
+    # need at least 2 strikes above and 2 below ATM
+    if atm_idx < 2 or atm_idx > len(strikes) - 3:
+        continue
 
-    # need at least 2 consecutive CE OTM strikes decayed more than decay_limit
-    cond_ce = (len(ce_otm) >= 2 and
-               (ce_otm["CE_decay"].iloc[0] <= decay_limit and ce_otm["CE_decay"].iloc[1] <= decay_limit))
+    ce_atm_strike = strikes[atm_idx]
+    ce_otm1_strike = strikes[atm_idx + 1]
+    ce_otm2_strike = strikes[atm_idx + 2]
 
-    cond_pe = (len(pe_otm) >= 2 and
-               (pe_otm["PE_decay"].iloc[0] <= decay_limit and pe_otm["PE_decay"].iloc[1] <= decay_limit))
+    pe_atm_strike = strikes[atm_idx]
+    pe_otm1_strike = strikes[atm_idx - 1]
+    pe_otm2_strike = strikes[atm_idx - 2]
 
-    if cond_ce or cond_pe:
+    ce_atm_row = get_row_by_strike(df, ce_atm_strike)
+    ce_otm1_row = get_row_by_strike(df, ce_otm1_strike)
+    ce_otm2_row = get_row_by_strike(df, ce_otm2_strike)
+
+    pe_atm_row = get_row_by_strike(df, pe_atm_strike)
+    pe_otm1_row = get_row_by_strike(df, pe_otm1_strike)
+    pe_otm2_row = get_row_by_strike(df, pe_otm2_strike)
+
+    if any(r is None for r in [ce_atm_row, ce_otm1_row, ce_otm2_row,
+                                pe_atm_row, pe_otm1_row, pe_otm2_row]):
+        continue
+
+    ce_atm_decay = decay_pct(ce_atm_row["CE_OI"], ce_atm_row["CE_prev_OI"])
+    ce_otm1_decay = decay_pct(ce_otm1_row["CE_OI"], ce_otm1_row["CE_prev_OI"])
+    ce_otm2_decay = decay_pct(ce_otm2_row["CE_OI"], ce_otm2_row["CE_prev_OI"])
+
+    pe_atm_decay = decay_pct(pe_atm_row["PE_OI"], pe_atm_row["PE_prev_OI"])
+    pe_otm1_decay = decay_pct(pe_otm1_row["PE_OI"], pe_otm1_row["PE_prev_OI"])
+    pe_otm2_decay = decay_pct(pe_otm2_row["PE_OI"], pe_otm2_row["PE_prev_OI"])
+
+    # ---- CALL SIGNAL ----
+    call_signal = (
+        ce_atm_decay <= decay_limit and
+        ce_otm1_decay <= decay_limit and
+        ce_otm2_decay <= decay_limit and
+        pe_atm_decay > 0 and
+        pe_otm1_decay > 0
+    )
+
+    # ---- PUT SIGNAL ----
+    put_signal = (
+        pe_atm_decay <= decay_limit and
+        pe_otm1_decay <= decay_limit and
+        pe_otm2_decay <= decay_limit and
+        ce_atm_decay > 0 and
+        ce_otm1_decay > 0 and
+        ce_otm2_decay > 0
+    )
+
+    if call_signal or put_signal:
+        signal = []
+        if call_signal:
+            signal.append("CALL")
+        if put_signal:
+            signal.append("PUT")
+
         out_rows.append({
             "Symbol": sym,
             "Close": round(spot, 2),
-            "CE_OTM1": int(ce_otm["Strike"].iloc[0]) if len(ce_otm) >= 1 else "",
-            "CE_Dec1%": round(ce_otm["CE_decay"].iloc[0], 2) if len(ce_otm) >= 1 else "",
-            "CE_OTM2": int(ce_otm["Strike"].iloc[1]) if len(ce_otm) >= 2 else "",
-            "CE_Dec2%": round(ce_otm["CE_decay"].iloc[1], 2) if len(ce_otm) >= 2 else "",
-            "CE_OTM3": int(ce_otm["Strike"].iloc[2]) if len(ce_otm) >= 3 else "",
-            "CE_Dec3%": round(ce_otm["CE_decay"].iloc[2], 2) if len(ce_otm) >= 3 else "",
+            "Signal": " / ".join(signal),
+            "ATM_Strike": ce_atm_strike,
 
-            "PE_OTM1": int(pe_otm["Strike"].iloc[0]) if len(pe_otm) >= 1 else "",
-            "PE_Dec1%": round(pe_otm["PE_decay"].iloc[0], 2) if len(pe_otm) >= 1 else "",
-            "PE_OTM2": int(pe_otm["Strike"].iloc[1]) if len(pe_otm) >= 2 else "",
-            "PE_Dec2%": round(pe_otm["PE_decay"].iloc[1], 2) if len(pe_otm) >= 2 else "",
-            "PE_OTM3": int(pe_otm["Strike"].iloc[2]) if len(pe_otm) >= 3 else "",
-            "PE_Dec3%": round(pe_otm["PE_decay"].iloc[2], 2) if len(pe_otm) >= 3 else "",
+            "CE_ATM_Dec%": round(ce_atm_decay, 2),
+            "CE_OTM1_Dec%": round(ce_otm1_decay, 2),
+            "CE_OTM2_Dec%": round(ce_otm2_decay, 2),
+
+            "PE_ATM_Dec%": round(pe_atm_decay, 2),
+            "PE_OTM1_Dec%": round(pe_otm1_decay, 2),
+            "PE_OTM2_Dec%": round(pe_otm2_decay, 2),
         })
 
 # ---------------------------- OUTPUT ----------------------------
@@ -303,13 +339,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-
-
-
-
-
-
 
 
 st.markdown("""
